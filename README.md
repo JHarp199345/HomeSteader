@@ -6,34 +6,49 @@ It starts with property records, but the core is deliberately domain-neutral: a 
 
 ## Safety boundary
 
-This repository currently uses **fictional plain-text fixtures only**. Do not add client, tenant, health, HMIS, or employer records here. Before Homesteader handles real workplace records, it needs approved storage, access control, retention, encryption, audit, and organizational-policy decisions. A local file is not automatically an authorized records system.
+This repository currently uses **fictional fixtures only**. Do not add client, tenant, health, HMIS, or employer records here. Before Homesteader handles real workplace records, it needs approved storage, access control, retention, encryption, audit, and organizational-policy decisions. A local file is not automatically an authorized records system.
 
 The core has no web endpoint or outbound network behavior. It is local-only by default. Users may later configure an approved AI provider or use an approved work AI application manually; Homesteader must never silently grant broad database access. See [the security model](docs/SECURITY_MODEL.md).
 
-## First proof of concept
+## Current prototype
 
-The first milestone is intentionally narrow:
+The current working prototype is intentionally local and cautious. It supports:
 
-1. Ingest a fictional lease.
-2. Ingest a differently formatted addendum later.
-3. Extract the relevant facts.
-4. Link the addendum to the lease only when the evidence is strong.
-5. Preserve the source, explanation, confidence score, and an append-only ledger event.
-6. Put an intentionally ambiguous document in **Needs Review** rather than guessing.
+- HMIS-oriented fictional intake records, including a contact sheet that can establish a client through an HMIS number.
+- Open intake packets for a new client or a recurring document bundle scanned across several sessions.
+- Packet-level client proposals when an identity-bearing document arrives before or after related documents.
+- Detached documents that can be attached to an open packet later.
+- Review decisions to file with an existing client, create a provisional client, or leave an item unassigned.
+- Exact source-file hash checks that prevent a previously processed scan from being filed again.
+- Plain text and PDF intake. PDFs with embedded text are read locally; image-only PDFs use local macOS Vision OCR when the required macOS components are available.
+- A local NiceGUI workspace for packet intake, upload, detached-document attachment, and review decisions.
+- A folder intake action that processes only new `.pdf` and `.txt` files from `inbox/` into the active packet.
+
+OCR-derived facts are never silently filed. They remain in review until a person confirms the client association and filing decision.
 
 ## Run it
 
-Requires Python 3.11+ and no external packages.
+Requires Python 3.11+. The local workspace dependencies are installed from `pyproject.toml`.
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m homesteader.cli --state data/demo.json ingest fixtures/lease_elena_ramirez.txt
-python3 -m homesteader.cli --state data/demo.json ingest fixtures/pet_addendum_elena_ramirez.txt
-python3 -m homesteader.cli --state data/demo.json status
-python3 -m homesteader.cli inbox
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m homesteader.app --port 8765
 ```
 
-The prototype supports plain-text fixtures only. PDF/image OCR, local-model adapters, secure sync, and a user interface are planned next layers—not implied capabilities of this first proof.
+Open `http://127.0.0.1:8765`. The workspace binds only to the local computer; it is not exposed to the network.
+
+For a packet scanned over time from the command line:
+
+```bash
+.venv/bin/python -m homesteader.cli --state data/demo.json start-packet --label "New client intake"
+.venv/bin/python -m homesteader.cli --state data/demo.json add-to-packet PACKET_ID fixtures/completed_consent_missing_participant.txt
+.venv/bin/python -m homesteader.cli --state data/demo.json add-to-packet PACKET_ID fixtures/contact_information_jasmine.txt
+.venv/bin/python -m homesteader.cli --state data/demo.json close-packet PACKET_ID
+```
+
+To use the folder intake action, place supported files in `inbox/`, choose the intended active packet in the local workspace, then select **Process new scans**. Files remain in place; a raw-file hash prevents a later pass from processing the same file again.
 
 ## Current structure
 
@@ -52,6 +67,31 @@ The prototype supports plain-text fixtures only. PDF/image OCR, local-model adap
 - **Relationships** are explicit, provenance-carrying links such as `modifies`, `documents`, or `responds_to`.
 
 The engine must separate confirmed source facts, derived relationships, and unconfirmed AI hypotheses. Automated links must be explainable and reversible.
+
+## Intake packets
+
+An **intake packet** is a durable working set for one coherent client event, such as a new-client enrollment or a quarterly recertification. It can remain open while documents arrive one at a time or in an unreliable order.
+
+1. Every source is preserved and evaluated independently.
+2. Strong identity evidence, especially an HMIS number, can establish a client anywhere in the packet.
+3. When one client is established, related unresolved documents receive that client as a proposed review choice. A proposal is not an automatic assignment.
+4. A document scanned outside a packet can be deliberately attached to an open packet later.
+5. A packet closes when the intake work is complete, leaving its source documents and decision history intact.
+
+This is deliberately not a “most recent upload wins” model. Scan order is helpful context, not proof of identity.
+
+## Implementation practices
+
+- **Local first:** document extraction, PDF parsing, OCR, hash comparison, and the browser workspace run on the local computer. The project does not send documents to an AI service by default.
+- **Raw source preservation:** original names, raw hashes, source format, source size, extraction method, and extracted text are retained as evidence.
+- **Exact before fuzzy:** raw-byte hashes block repeat scans. Normalized text similarity creates a review candidate rather than deleting or merging records.
+- **Hard identifiers before names:** HMIS identifiers and compatible identity facts carry more weight than a name, a signature, upload order, or a model confidence score. The same pattern is intended for CHAMP as that source system is added.
+- **Human confirmation for uncertainty:** OCR-derived assignments, competing identities, missing identifiers, and possible duplicates remain visible in the review queue.
+- **Append-only history:** client confirmation, packet proposals, duplicate detection, manual assignments, and filing decisions are ledger events rather than destructive edits.
+- **Recurring records are chronological:** the same client and form type with a later stated date or reporting period is a new occurrence, not a replacement for the prior packet. Exact repeat source files are still skipped.
+- **Narrow automation boundaries:** folder intake processes supported, unseen files only and requires an explicitly selected active packet. Background watching is intentionally not enabled yet.
+
+See [packet intake](docs/PACKET_INTAKE.md), [identity rules](docs/HMIS_IDENTITY_RULE.md), [temporal provenance](docs/TEMPORAL_PROVENANCE.md), and [the security model](docs/SECURITY_MODEL.md) for the underlying decisions.
 
 ## Sorting before AI
 

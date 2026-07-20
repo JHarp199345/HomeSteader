@@ -8,10 +8,16 @@ from pathlib import Path
 import re
 from uuid import uuid4
 
+from pypdf import PdfReader
+
 from .assurance import Decision, assess_relationship
 from .case_management import DOCUMENT_RULES
 from .entity_resolution import IdentityDecision, PersonCandidate, resolve_person
 from .extraction import extract_common_facts
+from .ocr import recognize_pdf_with_vision
+
+
+SUPPORTED_INTAKE_SUFFIXES = {".pdf", ".txt"}
 
 
 def now() -> str:
@@ -116,9 +122,10 @@ class HomesteaderStore:
         if self.path.exists():
             data = json.loads(self.path.read_text())
             data.setdefault("intake_occurrences", [])
+            data.setdefault("intake_packets", [])
             data.setdefault("counters", {"temporary_file": 0})
             return data
-        return {"documents": [], "intake_occurrences": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "counters": {"temporary_file": 0}}
+        return {"documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "counters": {"temporary_file": 0}}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,10 +183,11 @@ class HomesteaderStore:
         self.data["relationships"].append(relationship)
         return relationship
 
-    def ingest(self, source: Path) -> dict:
-        text = source.read_text()
+    def ingest(self, source: Path, *, packet_id: str | None = None, original_name: str | None = None) -> dict:
+        text, extraction_issue, extraction_method = self._extract_source_text(source)
         extracted = extract_document(text)
-        content_hash = sha256(text.encode()).hexdigest()
+        source_bytes = source.read_bytes()
+        content_hash = sha256(source_bytes).hexdigest()
         normalized_hash = normalized_content_hash(text)
         occurrence = {"id": str(uuid4()), "source_name": source.name, "sha256": content_hash, "observed_at": now()}
         self.data["intake_occurrences"].append(occurrence)
@@ -192,11 +200,19 @@ class HomesteaderStore:
                 occurrence["id"],
             )
         document = {
-            "id": str(uuid4()), "original_name": source.name, "sha256": content_hash,
+            "id": str(uuid4()), "original_name": original_name or source.name, "sha256": content_hash,
             "normalized_sha256": normalized_hash,
-            "source_text": text, "extracted": asdict(extracted), "ingested_at": now(),
+            "source_text": text, "source_format": source.suffix.casefold().lstrip(".") or "unknown",
+            "source_size_bytes": len(source_bytes), "intake_packet_id": packet_id,
+            "extracted": asdict(extracted), "ingested_at": now(),
         }
         self.data["documents"].append(document)
+
+        document["text_extraction"] = {"method": extraction_method, "issue": extraction_issue}
+        if extraction_issue:
+            return self._review(document, extraction_issue)
+        if extraction_method == "macos_vision_ocr":
+            return self._review(document, "Text was recognized locally from a scan. Confirm the extracted facts and client association before filing.")
 
         near_duplicate = next(
             (item for item in self.data["documents"][:-1] if item.get("normalized_sha256") == normalized_hash),
@@ -227,6 +243,167 @@ class HomesteaderStore:
         if extracted.document_type == "form_template":
             return self._catalog_form(document)
         return self._review(document, "Document type is not supported by the v0 prototype.")
+
+    def _extract_source_text(self, source: Path) -> tuple[str, str | None, str]:
+        if source.suffix.casefold() == ".txt":
+            return source.read_text(), None, "plain_text"
+        if source.suffix.casefold() != ".pdf":
+            return "", f"Unsupported file type '{source.suffix or 'unknown'}'.", "unsupported"
+        try:
+            text = "\n".join(page.extract_text() or "" for page in PdfReader(source).pages).strip()
+        except Exception as error:
+            return "", f"PDF text could not be read locally: {error}", "embedded_pdf_text"
+        if text:
+            return text, None, "embedded_pdf_text"
+        text, issue = recognize_pdf_with_vision(source)
+        return text, issue, "macos_vision_ocr"
+
+    def ingest_inbox(self, path: Path, *, packet_id: str | None = None) -> dict:
+        """Process only source files not already preserved by their raw hash."""
+        processed, skipped = [], []
+        if not path.exists():
+            return {"processed": processed, "skipped": skipped}
+        known_hashes = {document["sha256"] for document in self.data["documents"]}
+        for source in sorted(item for item in path.iterdir() if item.is_file() and not item.name.startswith(".")):
+            if source.suffix.casefold() not in SUPPORTED_INTAKE_SUFFIXES:
+                skipped.append({"path": str(source), "reason": "Unsupported file type."})
+                continue
+            source_hash = sha256(source.read_bytes()).hexdigest()
+            if source_hash in known_hashes:
+                skipped.append({"path": str(source), "reason": "Already processed source file."})
+                continue
+            if packet_id:
+                result = self.add_to_intake_packet(packet_id, [source])
+                processed.append({"path": str(source), "result": result["results"][0]["result"]})
+            else:
+                processed.append({"path": str(source), "result": self.ingest(source)})
+            known_hashes.add(source_hash)
+        return {"processed": processed, "skipped": skipped}
+
+    def start_intake_packet(self, label: str | None = None) -> dict:
+        """Open a packet that can receive scans over time in any order."""
+        packet = {
+            "id": str(uuid4()),
+            "label": label or f"Packet received {now()}",
+            "created_at": now(),
+            "status": "open",
+            "document_ids": [],
+            "intake_occurrence_ids": [],
+            "source_names": [],
+        }
+        self.data["intake_packets"].append(packet)
+        return packet
+
+    def open_intake_packets(self) -> list[dict]:
+        return [packet for packet in self.data["intake_packets"] if packet.get("status", "open") == "open"]
+
+    def add_to_intake_packet(self, packet_id: str, sources: list[Path]) -> dict:
+        """Add newly scanned sources to an open packet and refresh its proposal."""
+        packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None)
+        if not packet:
+            raise ValueError(f"Intake packet '{packet_id}' does not exist.")
+        if packet.get("status", "open") != "open":
+            raise ValueError("This intake packet is closed. Start a new packet or resume an open one.")
+        results = []
+        for source in sources:
+            before_occurrences = len(self.data["intake_occurrences"])
+            result = self.ingest(source, packet_id=packet["id"])
+            results.append({"path": str(source), "result": result})
+            occurrence = self.data["intake_occurrences"][before_occurrences]
+            packet["intake_occurrence_ids"].append(occurrence["id"])
+            packet["source_names"].append(source.name)
+            document = next((item for item in self.data["documents"] if item["id"] == result.get("document_id")), None)
+            if document and document.get("intake_packet_id") == packet["id"]:
+                packet["document_ids"].append(result["document_id"])
+        self._refresh_packet_anchor(packet)
+        return {
+            "packet_id": packet["id"],
+            "results": results,
+            "proposed_person_id": packet.get("proposed_person_id"),
+            "anchor_conflict": packet.get("anchor_conflict"),
+        }
+
+    def attach_document_to_intake_packet(self, packet_id: str, document_id: str) -> dict:
+        """Bring a previously detached document into an open packet for review."""
+        packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None)
+        document = next((item for item in self.data["documents"] if item["id"] == document_id), None)
+        if not packet or not document:
+            raise ValueError("Both the intake packet and document must exist.")
+        if packet.get("status", "open") != "open":
+            raise ValueError("This intake packet is closed.")
+        if document.get("intake_packet_id") and document["intake_packet_id"] != packet_id:
+            raise ValueError("This document already belongs to another intake packet.")
+        document["intake_packet_id"] = packet_id
+        if document_id not in packet["document_ids"]:
+            packet["document_ids"].append(document_id)
+        self._refresh_packet_anchor(packet)
+        return {"packet_id": packet_id, "document_id": document_id, "proposed_person_id": packet.get("proposed_person_id")}
+
+    def close_intake_packet(self, packet_id: str) -> dict:
+        packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None)
+        if not packet:
+            raise ValueError(f"Intake packet '{packet_id}' does not exist.")
+        self._refresh_packet_anchor(packet)
+        packet["status"] = "closed"
+        packet["closed_at"] = now()
+        return packet
+
+    def ingest_packet(self, sources: list[Path], *, label: str | None = None) -> dict:
+        """Convenience wrapper for a packet that is complete in one sitting."""
+        packet = self.start_intake_packet(label)
+        result = self.add_to_intake_packet(packet["id"], sources)
+        self.close_intake_packet(packet["id"])
+        return result
+
+    def _refresh_packet_anchor(self, packet: dict) -> None:
+        anchor_people = self._packet_anchor_people(packet["document_ids"])
+        packet.pop("proposed_person_id", None)
+        packet.pop("anchor_conflict", None)
+        if len(anchor_people) == 1:
+            anchor = anchor_people[0]
+            packet["proposed_person_id"] = anchor["id"]
+            self._offer_packet_anchor_to_reviews(packet, anchor)
+        elif len(anchor_people) > 1:
+            packet["anchor_conflict"] = "Multiple client identities were established in this packet; no association was proposed."
+
+    def _packet_anchor_people(self, document_ids: list[str]) -> list[dict]:
+        person_ids = {
+            event["details"].get("person_id") or event["details"].get("participant_id")
+            for event in self.data["ledger_events"]
+            if event.get("details", {}).get("document_id") in document_ids
+        }
+        return [
+            entity for entity in self.data["entities"]
+            if entity["kind"] == "person" and entity["id"] in person_ids
+        ]
+
+    def _offer_packet_anchor_to_reviews(self, packet: dict, person: dict) -> None:
+        """Offer, but do not apply, a packet client to unresolved documents."""
+        person_name = person["name"]
+        candidate = {"entity_id": person["id"], "name": person_name, "source": "packet_anchor"}
+        for item in self.data["review_queue"]:
+            if item["status"] != "needs_review" or item.get("intake_occurrence_id"):
+                continue
+            document = next((entry for entry in self.data["documents"] if entry["id"] == item["document_id"]), None)
+            if not document or document.get("intake_packet_id") != packet["id"]:
+                continue
+            extracted = document["extracted"]
+            stated_name = extracted.get("participant") or extracted.get("tenant")
+            stated_hmis_id = extracted.get("hmis_id")
+            anchor_hmis_id = person.get("attributes", {}).get("hmis_id")
+            if stated_hmis_id and anchor_hmis_id and stated_hmis_id != anchor_hmis_id:
+                continue
+            if stated_name and stated_name.casefold() != person_name.casefold():
+                continue
+            if item.get("proposed_person_id") == person["id"]:
+                continue
+            item["candidates"] = [candidate, *[entry for entry in item.get("candidates", []) if entry.get("entity_id") != person["id"]]]
+            item["proposed_person_id"] = person["id"]
+            item["packet_id"] = packet["id"]
+            self._event("packet_client_proposed", document["id"], {
+                "packet_id": packet["id"], "document_id": document["id"], "proposed_person_id": person["id"],
+                "source": "single_hard_identity_anchor",
+            })
 
     def _record_income_declaration(self, document: dict, extracted: ExtractedDocument) -> dict:
         if not extracted.participant:
@@ -392,8 +569,10 @@ class HomesteaderStore:
         if item["status"] != "needs_review":
             raise ValueError(f"Review item '{review_id}' is already resolved.")
         resolution: dict[str, str | None] = {"action": action, "entity_id": entity_id, "note": note}
+        person: dict | None = None
         if action == "assign_existing":
-            if not entity_id or not any(entity["id"] == entity_id for entity in self.data["entities"]):
+            person = next((entity for entity in self.data["entities"] if entity["id"] == entity_id and entity["kind"] == "person"), None)
+            if not person:
                 raise ValueError("assign_existing requires an existing entity ID.")
         elif action == "create_person":
             if not new_person_name:
@@ -406,4 +585,10 @@ class HomesteaderStore:
         item["resolution"] = resolution
         item["resolved_at"] = now()
         self._event("human_review_resolved", item["document_id"], {"review_id": review_id, **resolution})
+        if person:
+            ledger = self._participant_ledger(person)
+            self._event("document_manually_assigned", ledger["id"], {
+                "document_id": item["document_id"], "participant_id": person["id"], "review_id": review_id,
+                "action": action, "note": note, "source": "human_review",
+            })
         return {"status": "resolved", "review_id": review_id, "resolution": resolution}

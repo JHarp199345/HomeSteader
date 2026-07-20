@@ -14,6 +14,16 @@ def main() -> None:
     subcommands = parser.add_subparsers(dest="command", required=True)
     ingest = subcommands.add_parser("ingest", help="Ingest a fictional plain-text document")
     ingest.add_argument("source", type=Path)
+    ingest_packet = subcommands.add_parser("ingest-packet", help="Ingest a coherent client packet without relying on file order")
+    ingest_packet.add_argument("sources", type=Path, nargs="+")
+    ingest_packet.add_argument("--label")
+    start_packet = subcommands.add_parser("start-packet", help="Open a packet for documents scanned over time")
+    start_packet.add_argument("--label")
+    add_packet = subcommands.add_parser("add-to-packet", help="Add documents to an open packet")
+    add_packet.add_argument("packet_id")
+    add_packet.add_argument("sources", type=Path, nargs="+")
+    close_packet = subcommands.add_parser("close-packet", help="Close an intake packet")
+    close_packet.add_argument("packet_id")
     inbox = subcommands.add_parser("inbox", help="Inspect a local inbox without uploading files")
     inbox.add_argument("path", type=Path, nargs="?", default=Path("inbox"))
     review = subcommands.add_parser("review", help="List or resolve local review items")
@@ -30,6 +40,18 @@ def main() -> None:
     store = HomesteaderStore(args.state)
     if args.command == "ingest":
         print(json.dumps(store.ingest(args.source), indent=2))
+        store.save()
+    elif args.command == "ingest-packet":
+        print(json.dumps(store.ingest_packet(args.sources, label=args.label), indent=2))
+        store.save()
+    elif args.command == "start-packet":
+        print(json.dumps(store.start_intake_packet(args.label), indent=2))
+        store.save()
+    elif args.command == "add-to-packet":
+        print(json.dumps(store.add_to_intake_packet(args.packet_id, args.sources), indent=2))
+        store.save()
+    elif args.command == "close-packet":
+        print(json.dumps(store.close_intake_packet(args.packet_id), indent=2))
         store.save()
     elif args.command == "inbox":
         print(json.dumps([
