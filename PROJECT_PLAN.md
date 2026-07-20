@@ -250,3 +250,7 @@ The first milestone is complete when a nontechnical user can upload two fictiona
 ## Identity reconciliation
 
 Case records use HMIS number as the permanent participant identifier. When incomplete documents arrive first, Homesteader may create a temporary file identifier. A unified search shows temporary and confirmed files together. After human verification, confirming an HMIS number replaces the temporary identifier while preserving the file’s documents, relationships, and ledger history.
+
+### Name-first reconciliation search
+
+Identifiers are system references, not user memory requirements. When an uploaded document cannot be associated automatically, the user searches the participant name visible on that document. Homesteader returns every relevant confirmed or temporary file associated with that name, including a concise document and relationship summary. Opening a result presents its documents in a scrollable viewer for verification. The user can attach the new document to that file, return to the results, or create a new file if no result is correct. IDs may be displayed for clarity but are never required as search input.
