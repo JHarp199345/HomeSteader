@@ -1,0 +1,8 @@
+[project]
+name = "homesteader"
+version = "0.0.1"
+description = "Local-first document intelligence prototype"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

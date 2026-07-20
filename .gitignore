@@ -1,0 +1,11 @@
+# Local records and generated state must never be committed.
+data/*
+!data/.gitkeep
+inbox/*
+!inbox/.gitkeep
+ai_staging/*
+!ai_staging/.gitkeep
+
+# Python artifacts
+__pycache__/
+*.py[cod]

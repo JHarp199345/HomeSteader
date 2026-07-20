@@ -1,0 +1,18 @@
+{
+  "lease": {
+    "tenant": "Elena Ramirez",
+    "property": "1624 Example Avenue",
+    "unit": "3B",
+    "signed_date": "January 6, 2026"
+  },
+  "addendum": {
+    "document_type": "lease_addendum",
+    "relationship": "modifies",
+    "target": "Residential Lease Agreement executed January 6, 2026",
+    "minimum_confidence": 0.95
+  },
+  "ambiguous_addendum": {
+    "status": "needs_review",
+    "relationship_created": false
+  }
+}
