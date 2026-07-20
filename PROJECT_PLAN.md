@@ -246,3 +246,7 @@ Create an intentionally unclear document: missing unit number, vague agreement r
 ## Initial definition of done
 
 The first milestone is complete when a nontechnical user can upload two fictional but related documents in any order and Homesteader correctly files, names, links, explains, and retrieves them—with no folder selection or manual tagging—and safely requests help when the evidence is ambiguous.
+
+## Identity reconciliation
+
+Case records use HMIS number as the permanent participant identifier. When incomplete documents arrive first, Homesteader may create a temporary file identifier. A unified search shows temporary and confirmed files together. After human verification, confirming an HMIS number replaces the temporary identifier while preserving the file’s documents, relationships, and ledger history.
