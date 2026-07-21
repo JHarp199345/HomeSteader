@@ -20,7 +20,8 @@ The current working prototype is intentionally local and cautious. It supports:
 - Detached documents that can be attached to an open packet later.
 - Review decisions to file with an existing client, create a provisional client, or leave an item unassigned.
 - Exact source-file hash checks that prevent a previously processed scan from being filed again.
-- Plain text and PDF intake. PDFs with embedded text are read locally; image-only PDFs use local macOS Vision OCR when the required macOS components are available.
+- Plain text, PDF, and phone-image intake (HEIC, JPEG, PNG, and TIFF). PDFs with embedded text are read locally; image-only PDFs and images use local macOS Vision OCR when the required macOS components are available.
+- A private local archive of each accepted source scan, so later review is grounded in the original record rather than extracted text alone. The intake copy is not moved or deleted.
 - A local NiceGUI workspace for packet intake, upload, detached-document attachment, and review decisions.
 - A folder intake action that processes only new `.pdf` and `.txt` files from `inbox/` into the active packet.
 
@@ -50,6 +51,19 @@ For a packet scanned over time from the command line:
 
 To use the folder intake action, place supported files in `inbox/`, choose the intended active packet in the local workspace, then select **Process new scans**. Files remain in place; a raw-file hash prevents a later pass from processing the same file again.
 
+### iCloud Drive scan folder
+
+Homesteader does not need an iCloud API or an internet endpoint to use a folder that iCloud Drive has already synchronized to this Mac. Create an approved folder in the Files app—for example, `Homesteader Intake`—and run the local workspace with that folder selected:
+
+```bash
+.venv/bin/python -m homesteader.app \
+  --inbox "~/Library/Mobile Documents/com~apple~CloudDocs/Homesteader Intake"
+```
+
+Scan documents into that folder from the Files app. On the Mac, open the appropriate packet and select **Process new scans**. Homesteader reads the already-synced local copies only; it does not create a public service, browse iCloud, or transmit files. The scan folder path is displayed in the workspace so the active intake location is always visible.
+
+Use this only under the organization’s approved iCloud/account policy. Standard iCloud Drive encryption and Advanced Data Protection are distinct settings; Homesteader does not assume or change either one.
+
 ## Current structure
 
 - `homesteader/` — local prototype code
@@ -65,6 +79,16 @@ To use the folder intake action, place supported files in `inbox/`, choose the i
 - **Evidence** is the preserved original item plus extracted metadata.
 - **Ledgers** are append-only chronological events affecting an entity or workflow.
 - **Relationships** are explicit, provenance-carrying links such as `modifies`, `documents`, or `responds_to`.
+
+This is not restricted to a fixed form catalog. A record contributes whichever supported facts it actually contains. For example, a lease can connect a participant name, landlord, property, unit, and agreement date. The relationship graph then supports reverse questions such as “Which participant files are associated with this landlord or property?” Same-name ambiguity remains in review rather than becoming an automatic association.
+
+The same principle applies to housing documents that are not leases: move-in assistance requests, rent-reasonableness forms, landlord communications, and housing-search or retention plans can append their stated relationships to the participant record.
+
+For ambiguous photos, screenshots, and scans, the review workflow accepts a short user context note: for example, “Water damage on the bedroom wall in Unit 1 at Harbor View, reported by Jasmine Morales today.” The note is preserved as user-provided provenance and becomes evidence linked to the selected participant file. It can be typed or entered with the Mac’s built-in dictation; the original image remains unchanged.
+
+When a context note explicitly names an already-recorded property, unit, or landlord, Homesteader links that evidence to the known entity as user-context provenance. It does not create a new entity or guess from a vague phrase.
+
+Blank or reusable forms belong in the **Form Bank**, not in an unknown participant file. Known blank forms can be cataloged automatically; for an unfamiliar blank form, the reviewer can deliberately select **Store in Form Bank**. The original stored scan remains available for later viewing or printing.
 
 The engine must separate confirmed source facts, derived relationships, and unconfirmed AI hypotheses. Automated links must be explainable and reversible.
 
@@ -100,3 +124,52 @@ AI is an enhancement, not a prerequisite. The first sorting pass uses observable
 Near duplicates—such as a rescan with different whitespace or punctuation—are held as review candidates rather than silently discarded. See [the batch inference model](docs/BATCH_INFERENCE_MODEL.md) for how local pre-processing and a frontier model work together on a selected backlog.
 
 Recurring records are tracked as time-based ledger events, not merged merely because their content or amounts resemble a previous submission. Undated sources remain explicitly undated; see [temporal provenance](docs/TEMPORAL_PROVENANCE.md).
+
+The fictional TLS packet scenarios in [the TLS test matrix](docs/TLS_PACKET_TEST_MATRIX.md) cover the actual initial, quarterly, and annual income-verification structure without placing any participant data in the repository.
+
+The project’s end-to-end fictional TLS stress workflow deliberately mixes blank forms, periodic records, same-name participants, leases, landlord records, a context-annotated photo, and duplicate intake. This validates deterministic safeguards before optional AI classification is introduced.
+
+Optional AI integration now has a local, model-neutral proposal contract: an AI host may return document classification and source-quoted facts, while Homesteader validates that each quotation actually exists in the selected source and queues the result for human review. It never gives the host direct database write access. See [the AI proposal contract](docs/AI_PROPOSAL_CONTRACT.md).
+
+## Correction reports
+
+Homesteader can audit its own local record state and produce evidence-backed correction findings for the same kinds of work that a manual data-quality review catches: unresolved identity conflicts, missing HMIS confirmation, duplicate checks, OCR confirmation, missing time context, classification decisions, and missing local source archives. Each finding names the PTC when determinable, the affected document, the observed error, a clear recommended correction, and the source of the finding. It does not invent compliance violations or modify records during the audit.
+
+The spreadsheet exporter creates a correction-report workbook with a readable working sheet and an `Audit Data` sheet ready for Excel or Google Sheets import. It uses only the local audit findings; it does not contact HMIS, CHAMP, or another external system.
+
+For the current local prototype, generate the findings JSON and then the workbook:
+
+```bash
+.venv/bin/python -m homesteader.cli --state data/homesteader.json correction-findings > /tmp/homesteader-findings.json
+node tools/export_correction_report.mjs /tmp/homesteader-findings.json correction-report.xlsx
+```
+
+An in-app export button is the next convenience layer; the audit rules and workbook output are already local and testable.
+
+## Housing Services schedules
+
+Housing Services is now the first active domain module. A recorded TLS enrollment starts a **standard 24-month timeline**. The prototype currently includes the one confirmed recurring rule represented by its fictional TLS fixtures: an initial and then quarterly income eligibility/verification record. It can report whether each expected quarter is documented or missing and includes missing periods in the local correction report.
+
+For an existing caseload brought into Homesteader mid-program, a quarterly checkpoint can establish the participant/program network and carry a stated enrollment date without triggering a retroactive missing-document list. Its ingestion creates a **historical baseline**; only scheduled obligations after that baseline are audited. This lets the system begin with the paperwork actually available today rather than demanding a complete historical import.
+
+A recognized program-exit document with an exact HMIS identity, exit date, and one unambiguous program case closes future schedule expectations while retaining the complete digital record. It does not delete or hide the participant file. If a purported exit record lacks an exit date or cannot identify one program case, it goes to review rather than closing anything.
+
+This is deliberately a configurable policy layer, not an attempt to guess every program rule. Additional TLS, ABH, shelter, and tiny-home requirements should be added only after their actual checklist, cadence, and exception policy are confirmed. Extensions, transfers, pauses, and exits must be explicit ledger events; Homesteader never assumes them.
+
+Due-diligence forms are **event-triggered evidence**, not scheduled requirements. They document a caseworker's good-faith effort to obtain information or make contact, so their absence is never reported as a missing periodic form.
+
+### Completed copies are not automatically duplicates
+
+When a later upload is the same form for the same HMIS number and stated
+reporting period/date, but it fills fields that were blank in an earlier copy,
+Homesteader proposes a **completed revision**. It does not replace either file.
+After a human confirms it, the newer source receives an append-only
+`supersedes_for_fields` link to the incomplete source, recording exactly which
+facts it now supports. Conflicting values, different reporting periods, and
+exact re-scans still use the normal review/duplicate safeguards.
+
+To inspect the derived schedule locally:
+
+```bash
+.venv/bin/python -m homesteader.cli --state data/homesteader.json housing-schedule
+```

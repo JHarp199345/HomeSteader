@@ -1,0 +1,12 @@
+{
+  "document_type": "income_verification",
+  "facts": {
+    "participant": "Jasmine Morales",
+    "hmis_id": "H-TLS-000042",
+    "program": "TLS Adult SPA 2",
+    "enrollment_date": "2024-01-10",
+    "document_date": "2026-07-15",
+    "reporting_period": "Quarterly recertification - July 2026"
+  },
+  "must_not_propose": ["signature_identity"]
+}

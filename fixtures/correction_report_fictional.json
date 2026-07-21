@@ -1,0 +1,24 @@
+[
+  {
+    "caseworker": "Not recorded",
+    "ptc": "Jasmine Morales",
+    "participant_identifier": "T-000001",
+    "document": "",
+    "document_id": "",
+    "category": "Temporary Identity",
+    "error": "Participant file has a temporary identifier rather than a confirmed HMIS number.",
+    "recommendation": "Verify the participant HMIS number and replace the temporary identifier only after confirmation.",
+    "source": "Local participant identity record"
+  },
+  {
+    "caseworker": "Not recorded",
+    "ptc": "Unassigned participant",
+    "participant_identifier": "",
+    "document": "completed-consent.pdf",
+    "document_id": "fictional-document-01",
+    "category": "Missing Identity",
+    "error": "Consent form lacks required case identity: participant.",
+    "recommendation": "Locate or obtain the participant HMIS number, then confirm the correct participant file before filing.",
+    "source": "Homesteader review queue"
+  }
+]

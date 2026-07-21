@@ -27,10 +27,12 @@ def extract_common_facts(text: str) -> dict[str, dict]:
     confidence shape rather than bare values.
     """
     labels = {
-        "Tenant": "tenant", "Participant": "participant", "Name": "participant", "Program": "program", "HMIS number": "hmis_id", "HMIS ID": "hmis_id",
-        "Date of birth": "date_of_birth", "Document date": "document_date", "Reporting period": "reporting_period",
+        "Tenant": "tenant", "Participant": "participant", "Name": "participant", "Landlord": "landlord", "Program": "program",
+        "HMIS number": "hmis_id", "HMIS ID": "hmis_id", "HMIS ID #": "hmis_id",
+        "Date of birth": "date_of_birth", "Document date": "document_date", "Enrollment date": "enrollment_date", "Exit date": "exit_date", "Reporting period": "reporting_period",
         "Primary care provider": "primary_care_provider", "Mental health provider": "mental_health_provider",
-        "Emergency contact": "emergency_contact",
+        "Primary Care Provider Name": "primary_care_provider", "Mental Health Provider Name": "mental_health_provider",
+        "Emergency contact": "emergency_contact", "Emergency Contact Name": "emergency_contact",
     }
     facts = {}
     for label, field in labels.items():

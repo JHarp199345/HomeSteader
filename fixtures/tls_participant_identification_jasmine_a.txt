@@ -1,0 +1,18 @@
+TLS TAB 1 - PARTICIPANT IDENTIFICATION / CONTACT INFORMATION SHEET
+
+Participants Information
+Name: Jasmine Morales
+HMIS ID #: H-TLS-000042
+Date of Birth: January 15, 1990
+Cell: 555-0101
+Email: jasmine.a@example.test
+
+Emergency Contact Information
+Emergency Contact Name: Marisol Morales
+Emergency Contact Phone: 555-0102
+
+Physician Contact Information
+Primary Care Provider Name: Harbor Community Clinic
+
+Mental Health Provider Contact Information
+Mental Health Provider Name: Harbor Behavioral Health

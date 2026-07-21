@@ -42,6 +42,17 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertTrue(person["provisional"])
         self.assertEqual(len(self.store.pending_reviews()), 0)
 
+    def test_human_can_catalog_an_unclassified_blank_document_in_the_form_bank(self):
+        document = {"id": "document-blank", "original_name": "blank-release.txt", "source_text": "Blank Release Authorization\nComplete before use."}
+        self.store.data["documents"].append(document)
+        review = self.store._review(document, "Document type is not supported by the v0 prototype.")
+
+        resolved = self.store.resolve_review(review["review_id"], "catalog_form")
+
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["resolution"]["action"], "catalog_form")
+        self.assertTrue(any(entity["kind"] == "form_template" for entity in self.store.data["entities"]))
+
     def test_packet_proposes_a_later_identity_anchor_for_an_earlier_unidentified_document(self):
         result = self.store.ingest_packet([
             ROOT / "fixtures/completed_consent_missing_participant.txt",

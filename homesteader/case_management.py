@@ -22,6 +22,9 @@ DOCUMENT_RULES = {
     "consent_to_share": CaseDocumentRule(
         "consent_to_share", frozenset({"participant", "program", "hmis_id"}), "consent_recorded"
     ),
+    "program_exit": CaseDocumentRule(
+        "program_exit", frozenset({"participant", "hmis_id"}), "program_exit_recorded"
+    ),
     "income_declaration": CaseDocumentRule(
         "income_declaration", frozenset({"participant", "reporting_period", "hmis_id"}), "income_declaration_recorded"
     ),

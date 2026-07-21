@@ -31,10 +31,14 @@ def main() -> None:
     review_subcommands.add_parser("list", help="List pending review items")
     resolve = review_subcommands.add_parser("resolve", help="Record a human review decision")
     resolve.add_argument("review_id")
-    resolve.add_argument("--action", required=True, choices=["assign_existing", "create_person", "leave_unassigned"])
+    resolve.add_argument("--action", required=True, choices=["assign_existing", "create_person", "catalog_form", "accept_revision", "leave_unassigned"])
     resolve.add_argument("--entity-id")
     resolve.add_argument("--new-person-name")
     resolve.add_argument("--note")
+    subcommands.add_parser("correction-findings", help="Print local correction-report rows as JSON")
+    subcommands.add_parser("housing-schedule", help="Print derived Housing Services schedule status as JSON")
+    import_proposal = subcommands.add_parser("import-ai-proposal", help="Validate and queue a local AI proposal JSON file")
+    import_proposal.add_argument("proposal", type=Path)
     subcommands.add_parser("status", help="Show stored counts")
     args = parser.parse_args()
     store = HomesteaderStore(args.state)
@@ -64,6 +68,12 @@ def main() -> None:
         else:
             print(json.dumps(store.resolve_review(args.review_id, args.action, entity_id=args.entity_id, new_person_name=args.new_person_name, note=args.note), indent=2))
             store.save()
+    elif args.command == "correction-findings":
+        print(json.dumps(store.correction_findings(), indent=2))
+    elif args.command == "housing-schedule":
+        print(json.dumps(store.housing_schedule_status(), indent=2))
+    elif args.command == "import-ai-proposal":
+        print(json.dumps(store.submit_ai_proposal(json.loads(args.proposal.read_text())), indent=2))
     else:
         print(json.dumps({key: len(value) for key, value in store.data.items()}, indent=2))
 

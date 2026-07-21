@@ -25,7 +25,33 @@ Homesteader reverses that burden. The user drops an item into an inbox, scans it
 - Human authority for consequential decisions: the system organizes, retrieves, drafts, coordinates, and summarizes; users retain legal, financial, and interpersonal judgment.
 - Designed for imperfect habits: tolerate bad filenames, delayed uploads, duplicates, incomplete context, screenshots, and inconsistent naming.
 
-## Initial domain: property operations
+## Initial domain: Housing Services operations
+
+Homesteader's first active domain is Housing Services: participant records,
+program enrollment, housing relationships, documentation obligations, and the
+caseworker evidence needed to support a client. Property operations remains a
+compatible future module, not the defining first use case.
+
+### Standard schedules and event-triggered evidence
+
+Each program module may define a verified standard duration, enrollment anchor,
+and periodic requirements. TLS begins with a 24-month standard timeline and
+the documented income eligibility/verification cadence. The framework derives
+missing, documented, and upcoming requirements from the enrollment ledger;
+extensions, transfers, pauses, and exits must be human-recorded events before
+they change that timeline.
+
+For established caseloads entering Homesteader mid-program, a periodic
+checkpoint may create a historical baseline. It can prove a participant's
+program relationship and record an enrollment date without causing the system
+to report every unimported historical form as missing. Schedule audits begin
+after that baseline.
+
+Due-diligence forms are event-triggered evidence of a caseworker's effort to
+obtain a document, make contact, or address a situation. They are never a
+missing scheduled requirement.
+
+## Compatible future domain: property operations
 
 Homesteader helps self-managing landlords and small property teams organize and coordinate their property records. It is not bookkeeping, rent processing, tax software, tenant screening, autonomous legal advice, or an autonomous property manager.
 
@@ -69,6 +95,17 @@ Appliance ledger: installed → warranty → repair → repeat repair → replac
 ```
 
 Corrections are recorded as new, reversible events—not destructive overwrites. Current views are derived from the record of events.
+
+### Completed revisions and duplicate protection
+
+An intentionally re-uploaded completed copy of the same form is not treated as
+a disposable duplicate. A completed-revision proposal requires a shared hard
+identity, form type, and reporting period or document date, plus additional
+fields that were absent from the earlier source and no conflicting substantive
+facts. Human confirmation creates an append-only `supersedes_for_fields`
+relationship; both source documents remain available. Exact raw-file matches,
+recurring documents from different periods, and substantive conflicts retain
+their separate duplicate/review paths.
 
 ### Evidence and relationships
 
@@ -203,14 +240,29 @@ Create an intentionally unclear document: missing unit number, vague agreement r
 ### Phase 2 — Searchable ledgers
 
 - Create entity views and lease/maintenance ledger views.
+- Add name-first participant-file search: show temporary and HMIS-confirmed files by name, open their evidence summaries, then let the human attach an ambiguous document or create a new provisional file. Users should never need to remember a temporary identifier.
 - Support direct search and source-cited conversational retrieval.
 - Generate standardized names and dynamic folder-like views without requiring folders as the primary model.
+- Add a local correction-report audit: translate unresolved review items, temporary identities, source-archive gaps, and other evidence-backed data-quality problems into per-caseworker/PTC findings with a plain-language correction recommendation.
+- Export correction reports as a readable Excel/Google Sheets-compatible workbook plus a machine-readable audit-data sheet. The audit must never alter source records or invent external-system discrepancies.
 
 ### Phase 3 — Context capture and maintenance workflow
 
 - Capture photos, voice notes, and messages from inside an existing workflow.
 - Add natural-language annotation for inbox items.
 - Build a maintenance-ledger workflow and recurrence detection from historical events.
+
+### Housing Services capability — handwritten records
+
+- Keep deterministic extraction as the first pass; use a selected local
+  vision-capable model only when a scanned or handwritten form needs a
+  transcription or labeled-fact proposal.
+- Restrict the staging client to a local loopback model endpoint and preserve
+  the original scan. A visual proposal may describe what it read, but cannot
+  automatically change identity, eligibility, timelines, or relationships.
+- Compare models on the same fictional scans for legibility, evidence quality,
+  uncertainty reporting, and unsupported-fact rate before using one with
+  approved workplace records.
 
 ### Phase 4 — Provider and connector expansion
 

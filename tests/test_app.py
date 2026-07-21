@@ -1,7 +1,9 @@
 import socket
 import unittest
 
-from homesteader.app import LOCAL_HOST, find_available_port
+from pathlib import Path
+
+from homesteader.app import LOCAL_HOST, find_available_port, local_path
 
 
 class AppTests(unittest.TestCase):
@@ -10,6 +12,9 @@ class AppTests(unittest.TestCase):
             occupied.bind((LOCAL_HOST, 0))
             candidate = find_available_port(occupied.getsockname()[1])
             self.assertNotEqual(candidate, occupied.getsockname()[1])
+
+    def test_local_path_expands_a_home_relative_path(self):
+        self.assertEqual(local_path("~/Homesteader Intake"), Path.home() / "Homesteader Intake")
 
 
 if __name__ == "__main__":

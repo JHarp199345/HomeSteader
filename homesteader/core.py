@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -11,13 +11,17 @@ from uuid import uuid4
 from pypdf import PdfReader
 
 from .assurance import Decision, assess_relationship
+from .audit import correction_findings
 from .case_management import DOCUMENT_RULES
 from .entity_resolution import IdentityDecision, PersonCandidate, resolve_person
 from .extraction import extract_common_facts
-from .ocr import recognize_pdf_with_vision
+from .housing_services import add_months, schedule_for_program
+from .ocr import recognize_image_with_vision, recognize_pdf_with_vision
+from .proposals import AIProposal, validate_proposal
 
 
-SUPPORTED_INTAKE_SUFFIXES = {".pdf", ".txt"}
+IMAGE_INTAKE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff"}
+SUPPORTED_INTAKE_SUFFIXES = {".pdf", ".txt", *IMAGE_INTAKE_SUFFIXES}
 
 
 def now() -> str:
@@ -34,16 +38,39 @@ def normalized_content_hash(text: str) -> str:
     return sha256(normalized.encode()).hexdigest()
 
 
+def review_category(reason: str) -> str:
+    """Put human work into an actionable queue without relying on a model."""
+    lowered = reason.casefold()
+    if "duplicate" in lowered:
+        return "duplicate_check"
+    if "completed revision" in lowered or "corrected version" in lowered:
+        return "revision_confirmation"
+    if ("multiple" in lowered or "more than one" in lowered) and ("participant" in lowered or "identity" in lowered or "name" in lowered):
+        return "identity_conflict"
+    if "hmis" in lowered or "participant identity" in lowered or "participant name" in lowered:
+        return "missing_identity"
+    if "ocr" in lowered or "scan" in lowered:
+        return "ocr_confirmation"
+    if "unsupported" in lowered or "document type" in lowered:
+        return "classification"
+    if "date" in lowered or "reporting period" in lowered:
+        return "missing_time_context"
+    return "other_review"
+
+
 @dataclass
 class ExtractedDocument:
     document_type: str
     tenant: str | None = None
     participant: str | None = None
+    landlord: str | None = None
     program: str | None = None
     property_address: str | None = None
     unit: str | None = None
     signed_date: str | None = None
     document_date: str | None = None
+    enrollment_date: str | None = None
+    exit_date: str | None = None
     reporting_period: str | None = None
     date_of_birth: str | None = None
     primary_care_provider: str | None = None
@@ -69,20 +96,29 @@ def extract_document(text: str) -> ExtractedDocument:
     has_completed_identity = bool(value("tenant") or value("participant") or find_value("Premises", text) or has_nonblank_signature)
     if "INCOME DECLARATION" in upper:
         document_type = "income_declaration"
+    elif "HOUSEHOLD COMPOSITION & INCOME ELIGIBILITY" in upper or "MYORG CALCULATOR" in upper or "INCOME VERIFICATION" in upper:
+        document_type = "income_verification"
     elif "CONTACT INFORMATION SHEET" in upper:
         document_type = "contact_information"
     elif "PROGRAM ENROLLMENT" in upper:
         document_type = "program_enrollment"
+    elif any(marker in upper for marker in {"HMIS EXIT SUMMARY", "PROGRAM EXIT", "EXIT SUMMARY FORM", "PROGRAM GRADUATION"}):
+        document_type = "program_exit"
     elif "CONSENT TO SHARE PROTECTED PERSONAL INFORMATION" in upper and not has_completed_identity:
         document_type = "form_template"
     elif "CONSENT TO SHARE PROTECTED PERSONAL INFORMATION" in upper:
         document_type = "consent_to_share"
+    elif any(marker in upper for marker in {
+        "MOVE-IN ASSISTANCE REQUEST", "RENT REASONABLENESS", "LANDLORD COMMUNICATION",
+        "HOUSING RETENTION PLAN", "HOUSING SEARCH PLAN",
+    }):
+        document_type = "housing_record"
     elif "PET" in upper and "ADDENDUM" in upper:
         document_type = "lease_addendum"
     elif "LEASE" in upper:
         document_type = "lease"
 
-    premises = find_value("Premises", text)
+    premises = find_value("Premises", text) or find_value("Property address", text)
     property_address = unit = None
     if premises:
         match = re.match(r"(.+?),\s*(?:Apartment|Unit)\s+(.+)$", premises, re.IGNORECASE)
@@ -90,17 +126,21 @@ def extract_document(text: str) -> ExtractedDocument:
             property_address, unit = match.group(1).strip(), match.group(2).strip()
         else:
             property_address = premises
+            unit = find_value("Unit", text)
 
     referenced = re.search(r"(?:executed|dated)\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})", text)
     return ExtractedDocument(
         document_type=document_type,
-        tenant=value("tenant"),
+        tenant=value("tenant") or value("participant"),
         participant=value("participant"),
+        landlord=value("landlord"),
         program=value("program"),
         property_address=property_address,
         unit=unit,
         signed_date=find_value("Lease signed", text),
         document_date=value("document_date"),
+        enrollment_date=value("enrollment_date"),
+        exit_date=value("exit_date"),
         reporting_period=value("reporting_period"),
         date_of_birth=value("date_of_birth"),
         primary_care_provider=value("primary_care_provider"),
@@ -124,12 +164,134 @@ class HomesteaderStore:
             data.setdefault("intake_occurrences", [])
             data.setdefault("intake_packets", [])
             data.setdefault("counters", {"temporary_file": 0})
+            data.setdefault("ai_proposals", [])
             return data
-        return {"documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "counters": {"temporary_file": 0}}
+        return {"documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "ai_proposals": [], "counters": {"temporary_file": 0}}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2) + "\n")
+
+    def correction_findings(self) -> list[dict]:
+        """Audit local record quality without altering records or calling a service."""
+        return correction_findings(self)
+
+    def housing_schedule_status(self, *, as_of: date | None = None) -> list[dict]:
+        """Derive standard program obligations without changing any file.
+
+        Only a recorded enrollment starts a schedule.  Extensions, transfers,
+        and pauses are intentionally not inferred; those will become explicit
+        ledger events before they alter the standard timeline.
+        """
+        today = as_of or date.today()
+        documents = {document["id"]: document for document in self.data["documents"]}
+        people = {entity["id"]: entity for entity in self.data["entities"] if entity["kind"] == "person"}
+        statuses = []
+        baseline_events = [event for event in self.data["ledger_events"] if event["type"] == "program_baseline_established"]
+        for enrollment in baseline_events:
+            details = enrollment.get("details", {})
+            enrollment_date = details.get("enrollment_date")
+            baseline_date = details.get("baseline_date")
+            person = people.get(details.get("participant_id"))
+            program = next((entity for entity in self.data["entities"] if entity["id"] == details.get("program_id")), None)
+            if not person or not program or not enrollment_date:
+                continue
+            try:
+                start = date.fromisoformat(enrollment_date)
+                baseline = date.fromisoformat(baseline_date)
+            except ValueError:
+                continue
+            schedule = schedule_for_program(program["name"])
+            if not schedule:
+                continue
+            exit_events = [
+                event for event in self.data["ledger_events"]
+                if event["type"] == "program_exit_recorded" and event.get("details", {}).get("participant_id") == person["id"]
+                and event.get("details", {}).get("program_id") == program["id"]
+            ]
+            exit_date = None
+            if exit_events:
+                try:
+                    exit_date = min(date.fromisoformat(event.get("details", {}).get("exit_date", "")) for event in exit_events)
+                except ValueError:
+                    exit_date = None
+            end = add_months(start, schedule.duration_months)
+            participant_events = [
+                event for event in self.data["ledger_events"]
+                if event.get("details", {}).get("participant_id") == person["id"]
+            ]
+            for requirement in schedule.scheduled_requirements:
+                for offset in range(requirement.starts_at_month, schedule.duration_months, requirement.every_months):
+                    due = add_months(start, offset)
+                    # Homesteader begins with whatever real-world checkpoint
+                    # it first receives. Historical requirements before that
+                    # baseline are not silently converted into accusations.
+                    if due < baseline or due > today or (exit_date and due >= exit_date):
+                        continue
+                    next_due = add_months(due, requirement.every_months)
+                    evidence = []
+                    for event in participant_events:
+                        if event["type"] not in requirement.event_types:
+                            continue
+                        document = documents.get(event.get("details", {}).get("document_id"))
+                        value = event.get("details", {}).get("document_date") or (document or {}).get("extracted", {}).get("document_date")
+                        try:
+                            document_day = date.fromisoformat(value) if value else None
+                        except ValueError:
+                            document_day = None
+                        if document_day and due <= document_day < next_due:
+                            evidence.append(event)
+                    statuses.append({
+                        "person_id": person["id"], "ptc": person["name"],
+                        "participant_identifier": person.get("attributes", {}).get("hmis_id") or person.get("attributes", {}).get("temporary_id") or "",
+                        "program": program["name"], "schedule": schedule.key,
+                        "enrollment_date": start.isoformat(), "baseline_date": baseline.isoformat(), "standard_end_date": end.isoformat(),
+                        "exit_date": exit_date.isoformat() if exit_date else None,
+                        "requirement_key": requirement.key, "requirement": requirement.label,
+                        "due_date": due.isoformat(), "status": "documented" if evidence else "missing",
+                        "evidence_document_ids": [event["details"]["document_id"] for event in evidence],
+                    })
+        return sorted(statuses, key=lambda item: (item["ptc"], item["due_date"], item["requirement_key"]))
+
+    def submit_ai_proposal(self, payload: dict) -> dict:
+        """Store an optional host-AI proposal after local evidence validation.
+
+        This does not apply facts, create relationships, or make network calls.
+        Valid proposals become a local review artifact; invalid proposals remain
+        rejected with their exact validation failures.
+        """
+        proposal = AIProposal.from_dict(payload)
+        document = next((item for item in self.data["documents"] if item["id"] == proposal.document_id), None)
+        if not document:
+            raise ValueError("AI proposal references a document that does not exist locally.")
+        errors = validate_proposal(
+            proposal, document.get("source_text", ""), source_format=document.get("source_format", "txt"),
+        )
+        record = {
+            "id": str(uuid4()), "proposal": proposal.as_dict(), "status": "needs_review" if not errors else "rejected",
+            "validation_errors": list(errors), "submitted_at": now(),
+        }
+        self.data["ai_proposals"].append(record)
+        self._event("ai_proposal_received", document["id"], {
+            "proposal_id": record["id"], "document_id": document["id"], "provider_id": proposal.provider_id,
+            "status": record["status"], "source": "local_proposal_import",
+        })
+        return record
+
+    def _archive_source(self, source: Path, content_hash: str, source_bytes: bytes) -> str:
+        """Preserve an accepted source locally without moving its intake copy.
+
+        The hash is part of the archive name, so the same raw source is stored
+        once even if it is encountered again from an inbox or packet. The path
+        stored in state is relative to the state directory, keeping an archive
+        portable with its JSON state and avoiding a hard-coded user path.
+        """
+        archive_dir = self.path.parent / "sources"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived = archive_dir / f"{content_hash}{source.suffix.casefold()}"
+        if not archived.exists():
+            archived.write_bytes(source_bytes)
+        return str(archived.relative_to(self.path.parent))
 
     def _entity(self, kind: str, name: str) -> dict:
         existing = next((e for e in self.data["entities"] if e["kind"] == kind and e["name"] == name), None)
@@ -155,7 +317,191 @@ class HomesteaderStore:
 
     def search_files(self, query: str) -> list[dict]:
         needle = query.casefold().strip()
-        return [{"person_id": entity["id"], "name": entity["name"], "hmis_id": entity.get("attributes", {}).get("hmis_id"), "temporary_id": entity.get("attributes", {}).get("temporary_id"), "status": "confirmed" if entity.get("attributes", {}).get("hmis_id") else "temporary"} for entity in self.data["entities"] if entity["kind"] == "person" and needle in " ".join([entity["name"], str(entity.get("attributes", {}).get("hmis_id") or ""), str(entity.get("attributes", {}).get("temporary_id") or "")]).casefold()]
+        if not needle:
+            return []
+        results = []
+        for entity in self.data["entities"]:
+            if entity["kind"] != "person":
+                continue
+            searchable = " ".join([
+                entity["name"],
+                str(entity.get("attributes", {}).get("hmis_id") or ""),
+                str(entity.get("attributes", {}).get("temporary_id") or ""),
+            ]).casefold()
+            if needle not in searchable:
+                continue
+            summary = self.participant_file(entity["id"])
+            results.append({
+                "person_id": entity["id"],
+                "name": entity["name"],
+                "hmis_id": entity.get("attributes", {}).get("hmis_id"),
+                "temporary_id": entity.get("attributes", {}).get("temporary_id"),
+                "status": "confirmed" if entity.get("attributes", {}).get("hmis_id") else "temporary",
+                "document_count": len(summary["documents"]),
+            })
+        return results
+
+    def participant_file(self, person_id: str) -> dict:
+        """Return a small, evidence-first view of one participant file.
+
+        This is intentionally derived from recorded events rather than a
+        separate mutable list of "file documents." A human can inspect what
+        supports a proposed association before assigning a new document.
+        """
+        person = next((entity for entity in self.data["entities"] if entity["id"] == person_id and entity["kind"] == "person"), None)
+        if not person:
+            raise ValueError("Participant file does not exist.")
+        document_ids = []
+        relevant_events = []
+        for event in self.data["ledger_events"]:
+            details = event.get("details", {})
+            if details.get("participant_id") != person_id and details.get("person_id") != person_id:
+                continue
+            relevant_events.append(event)
+            document_id = details.get("document_id")
+            if document_id and document_id not in document_ids:
+                document_ids.append(document_id)
+        documents_by_id = {document["id"]: document for document in self.data["documents"]}
+        documents = [
+            {
+                "id": document["id"],
+                "original_name": document["original_name"],
+                "document_type": document.get("extracted", {}).get("document_type", "unknown"),
+                "document_date": document.get("extracted", {}).get("document_date"),
+                "reporting_period": document.get("extracted", {}).get("reporting_period"),
+            }
+            for document_id in document_ids
+            if (document := documents_by_id.get(document_id))
+        ]
+        entities = {entity["id"]: entity for entity in self.data["entities"]}
+        adjacent: dict[str, list[tuple[str, str]]] = {}
+        for relationship in self.data["relationships"]:
+            from_id = relationship.get("from_entity_id")
+            to_id = relationship.get("to_entity_id")
+            if from_id and to_id:
+                adjacent.setdefault(from_id, []).append((to_id, relationship["type"]))
+                adjacent.setdefault(to_id, []).append((from_id, relationship["type"]))
+        nearby = {}
+        frontier = [(person_id, 0, [])]
+        visited = {person_id}
+        while frontier:
+            entity_id, distance, path = frontier.pop(0)
+            if distance >= 4:
+                continue
+            for neighbor_id, relationship_type in adjacent.get(entity_id, []):
+                if neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)
+                neighbor = entities.get(neighbor_id)
+                next_path = [*path, relationship_type]
+                if neighbor and neighbor["kind"] not in {"person", "participant_ledger"}:
+                    nearby[neighbor_id] = {
+                        "id": neighbor_id,
+                        "name": neighbor["name"],
+                        "kind": neighbor["kind"],
+                        "distance": distance + 1,
+                        "path": next_path,
+                    }
+                frontier.append((neighbor_id, distance + 1, next_path))
+        return {
+            "person_id": person["id"],
+            "name": person["name"],
+            "attributes": person.get("attributes", {}),
+            "status": "confirmed" if person.get("attributes", {}).get("hmis_id") else "temporary",
+            "documents": documents,
+            "event_count": len(relevant_events),
+            "events": sorted(relevant_events, key=lambda event: event.get("recorded_at", ""), reverse=True),
+            "related_entities": sorted(nearby.values(), key=lambda item: (item["distance"], item["kind"], item["name"].casefold())),
+        }
+
+    def participant_index(
+        self,
+        *,
+        query: str = "",
+        status: str = "all",
+        program: str | None = None,
+        has_lease: bool = False,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict]:
+        """Return a compact participant-file index, not a dashboard model."""
+        needle = query.casefold().strip()
+        entities = {entity["id"]: entity for entity in self.data["entities"]}
+        rows = []
+        for person in (entity for entity in self.data["entities"] if entity["kind"] == "person"):
+            attributes = person.get("attributes", {})
+            identifier = attributes.get("hmis_id") or attributes.get("temporary_id") or ""
+            if needle and needle not in f"{person['name']} {identifier}".casefold():
+                continue
+            person_status = "confirmed" if attributes.get("hmis_id") else "temporary"
+            if status != "all" and person_status != status:
+                continue
+            summary = self.participant_file(person["id"])
+            programs = sorted({
+                entities[relationship["to_entity_id"]]["name"]
+                for relationship in self.data["relationships"]
+                if relationship.get("type") == "enrolled_in" and relationship.get("from_entity_id") == person["id"]
+                and relationship.get("to_entity_id") in entities
+            })
+            if program and program not in programs:
+                continue
+            lease_count = sum(1 for relationship in self.data["relationships"] if relationship.get("type") == "tenant_under" and relationship.get("from_entity_id") == person["id"])
+            if has_lease and not lease_count:
+                continue
+            document_dates = [document.get("document_date") for document in summary["documents"] if document.get("document_date")]
+            if date_from and not any(date >= date_from for date in document_dates):
+                continue
+            if date_to and not any(date <= date_to for date in document_dates):
+                continue
+            rows.append({
+                "person_id": person["id"], "name": person["name"], "identifier": identifier,
+                "status": person_status, "document_count": len(summary["documents"]),
+                "programs": programs, "lease_count": lease_count,
+            })
+        return sorted(rows, key=lambda item: item["name"].casefold())
+
+    def relationship_search(self, query: str) -> list[dict]:
+        """Find participant files through a named relationship, not just a name.
+
+        A landlord or property search can therefore discover participant files
+        linked through property -> unit -> lease -> participant relationships.
+        This remains graph traversal over recorded links, not an AI guess.
+        """
+        needle = query.casefold().strip()
+        if not needle:
+            return []
+        entities = {entity["id"]: entity for entity in self.data["entities"]}
+        starting_ids = [entity_id for entity_id, entity in entities.items() if needle in entity["name"].casefold()]
+        adjacent: dict[str, set[str]] = {}
+        for relationship in self.data["relationships"]:
+            from_id = relationship.get("from_entity_id")
+            to_id = relationship.get("to_entity_id")
+            if not from_id or not to_id:
+                continue
+            adjacent.setdefault(from_id, set()).add(to_id)
+            adjacent.setdefault(to_id, set()).add(from_id)
+        found: dict[str, dict] = {}
+        for starting_id in starting_ids:
+            frontier = [(starting_id, 0)]
+            visited = {starting_id}
+            while frontier:
+                entity_id, distance = frontier.pop(0)
+                entity = entities.get(entity_id)
+                if entity and entity["kind"] == "person" and entity_id != starting_id:
+                    found[entity_id] = {
+                        "person_id": entity_id,
+                        "name": entity["name"],
+                        "hmis_id": entity.get("attributes", {}).get("hmis_id"),
+                        "temporary_id": entity.get("attributes", {}).get("temporary_id"),
+                        "relationship_distance": distance,
+                    }
+                if distance >= 4:
+                    continue
+                for neighbor in adjacent.get(entity_id, set()):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        frontier.append((neighbor, distance + 1))
+        return sorted(found.values(), key=lambda item: (item["relationship_distance"], item["name"].casefold()))
 
     def confirm_hmis_identity(self, person_id: str, hmis_id: str, note: str | None = None) -> dict:
         person = next((entity for entity in self.data["entities"] if entity["id"] == person_id and entity["kind"] == "person"), None)
@@ -183,6 +529,31 @@ class HomesteaderStore:
         self.data["relationships"].append(relationship)
         return relationship
 
+    def _completed_revision_candidate(self, document: dict, extracted: ExtractedDocument) -> tuple[dict, list[str]] | None:
+        """Find a safe candidate for an intentionally re-uploaded completed copy.
+
+        A revision requires a shared HMIS number, form type, and stated period
+        or document date.  This deliberately excludes loose name matching and
+        recurring quarterly forms from automatic revision proposals.
+        """
+        if not extracted.hmis_id or not (extracted.reporting_period or extracted.document_date):
+            return None
+        fields = ("participant", "hmis_id", "program", "document_date", "reporting_period", "enrollment_date", "date_of_birth", "primary_care_provider", "mental_health_provider", "emergency_contact")
+        for prior in reversed(self.data["documents"][:-1]):
+            prior_facts = prior.get("extracted", {})
+            same_identity = prior_facts.get("hmis_id") == extracted.hmis_id
+            same_instance = (
+                prior_facts.get("document_type") == extracted.document_type
+                and (prior_facts.get("reporting_period") == extracted.reporting_period or prior_facts.get("document_date") == extracted.document_date)
+            )
+            if not (same_identity and same_instance):
+                continue
+            improvements = [field for field in fields if not prior_facts.get(field) and getattr(extracted, field, None)]
+            conflicts = [field for field in fields if prior_facts.get(field) and getattr(extracted, field, None) and prior_facts[field] != getattr(extracted, field)]
+            if improvements and not conflicts:
+                return prior, improvements
+        return None
+
     def ingest(self, source: Path, *, packet_id: str | None = None, original_name: str | None = None) -> dict:
         text, extraction_issue, extraction_method = self._extract_source_text(source)
         extracted = extract_document(text)
@@ -204,6 +575,7 @@ class HomesteaderStore:
             "normalized_sha256": normalized_hash,
             "source_text": text, "source_format": source.suffix.casefold().lstrip(".") or "unknown",
             "source_size_bytes": len(source_bytes), "intake_packet_id": packet_id,
+            "stored_source_path": self._archive_source(source, content_hash, source_bytes),
             "extracted": asdict(extracted), "ingested_at": now(),
         }
         self.data["documents"].append(document)
@@ -213,6 +585,18 @@ class HomesteaderStore:
             return self._review(document, extraction_issue)
         if extraction_method == "macos_vision_ocr":
             return self._review(document, "Text was recognized locally from a scan. Confirm the extracted facts and client association before filing.")
+
+        revision = self._completed_revision_candidate(document, extracted)
+        if revision:
+            prior, fields = revision
+            self._event("completed_revision_proposed", prior["id"], {
+                "candidate_document_id": document["id"], "filled_fields": fields, "source": "deterministic_document_comparison",
+            })
+            return self._review(
+                document,
+                f"Possible completed revision of '{prior['original_name']}'. It matches the HMIS number, form type, and reporting period/date, and fills: {', '.join(fields)}.",
+                revision_of_document_id=prior["id"], revision_fields=fields,
+            )
 
         near_duplicate = next(
             (item for item in self.data["documents"][:-1] if item.get("normalized_sha256") == normalized_hash),
@@ -234,11 +618,13 @@ class HomesteaderStore:
             return self._create_lease(document, extracted)
         if extracted.document_type == "lease_addendum":
             return self._link_addendum(document, extracted)
-        if extracted.document_type == "income_declaration":
+        if extracted.document_type in {"income_declaration", "income_verification"}:
             return self._record_income_declaration(document, extracted)
         if extracted.document_type == "contact_information":
             return self._record_contact_information(document, extracted)
-        if extracted.document_type in {"program_enrollment", "consent_to_share"}:
+        if extracted.document_type == "housing_record":
+            return self._record_housing_document(document, extracted)
+        if extracted.document_type in {"program_enrollment", "consent_to_share", "program_exit"}:
             return self._record_case_document(document, extracted)
         if extracted.document_type == "form_template":
             return self._catalog_form(document)
@@ -248,6 +634,9 @@ class HomesteaderStore:
         if source.suffix.casefold() == ".txt":
             return source.read_text(), None, "plain_text"
         if source.suffix.casefold() != ".pdf":
+            if source.suffix.casefold() in IMAGE_INTAKE_SUFFIXES:
+                text, issue = recognize_image_with_vision(source)
+                return text, issue, "macos_vision_ocr"
             return "", f"Unsupported file type '{source.suffix or 'unknown'}'.", "unsupported"
         try:
             text = "\n".join(page.extract_text() or "" for page in PdfReader(source).pages).strip()
@@ -414,11 +803,13 @@ class HomesteaderStore:
         if review:
             return review
         ledger = self._income_ledger(participant)
-        self._event("income_declaration_recorded", ledger["id"], {
+        event_type = "income_verification_recorded" if extracted.document_type == "income_verification" else "income_declaration_recorded"
+        self._event(event_type, ledger["id"], {
             "document_id": document["id"], "participant_id": participant["id"],
             "document_date": extracted.document_date, "reporting_period": extracted.reporting_period,
             "source": "document_extraction",
         })
+        self._record_program_checkpoint(participant, document, extracted)
         return {"status": "filed", "document_id": document["id"], "income_ledger_id": ledger["id"], "reporting_period": extracted.reporting_period, "confidence": 1.0, "reasons": ["Participant and reporting period are stated in the source document."]}
 
     def _record_case_document(self, document: dict, extracted: ExtractedDocument) -> dict:
@@ -430,15 +821,82 @@ class HomesteaderStore:
         participant, review = self._resolve_person_for_document(document, extracted)
         if review:
             return review
+        if extracted.document_type == "program_exit":
+            return self._record_program_exit(document, extracted, participant)
         program = self._entity("program", extracted.program)
         case_ledger = self._entity("case_ledger", f"{participant['id']} / {extracted.program}")
         self._relationship("enrolled_in", participant["id"], program["id"], "document_extraction")
         self._relationship("has_case", participant["id"], case_ledger["id"], "document_extraction")
         self._event(rule.ledger_event, case_ledger["id"], {
             "document_id": document["id"], "participant_id": participant["id"], "program_id": program["id"],
-            "document_date": extracted.document_date, "source": "document_extraction",
+            "document_date": extracted.document_date, "enrollment_date": extracted.enrollment_date,
+            "source": "document_extraction",
         })
+        if extracted.document_type == "program_enrollment" and extracted.enrollment_date:
+            self._ensure_program_baseline(
+                participant, program, case_ledger, enrollment_date=extracted.enrollment_date,
+                baseline_date=extracted.enrollment_date, document_id=document["id"], source="enrollment_record",
+            )
         return {"status": "filed", "document_id": document["id"], "case_ledger_id": case_ledger["id"], "document_type": extracted.document_type, "confidence": 1.0, "reasons": ["Participant and program are stated in the source document."]}
+
+    def _record_program_exit(self, document: dict, extracted: ExtractedDocument, participant: dict) -> dict:
+        if not extracted.exit_date:
+            return self._review(document, "Program exit record lacks an exit date. It cannot safely close a program case.")
+        candidate_programs = []
+        if extracted.program:
+            candidate_programs = [entity for entity in self.data["entities"] if entity["kind"] == "program" and entity["name"] == extracted.program]
+        else:
+            program_ids = {
+                relationship["to_entity_id"] for relationship in self.data["relationships"]
+                if relationship.get("from_entity_id") == participant["id"] and relationship.get("type") in {"enrolled_in", "program_documented_for"}
+            }
+            candidate_programs = [entity for entity in self.data["entities"] if entity["id"] in program_ids and entity["kind"] == "program"]
+        if len(candidate_programs) != 1:
+            return self._review(document, "Program exit record does not identify one unambiguous program case to close.")
+        program = candidate_programs[0]
+        case_ledger = self._entity("case_ledger", f"{participant['id']} / {program['name']}")
+        self._relationship("has_case", participant["id"], case_ledger["id"], "document_extraction")
+        self._event("program_exit_recorded", case_ledger["id"], {
+            "document_id": document["id"], "participant_id": participant["id"], "program_id": program["id"],
+            "exit_date": extracted.exit_date, "document_date": extracted.document_date,
+            "source": "document_extraction",
+        })
+        return {"status": "filed", "document_id": document["id"], "case_ledger_id": case_ledger["id"], "document_type": extracted.document_type, "confidence": 1.0, "reasons": ["Exact HMIS identity and one program case were recorded."]}
+
+    def _record_program_checkpoint(self, participant: dict, document: dict, extracted: ExtractedDocument) -> None:
+        """Use a periodic form as evidence of a case without backfilling its past.
+
+        A quarterly form often carries enough legitimate information to build a
+        participant/program network.  Its arrival establishes Homesteader's
+        baseline *today*, while the form's enrollment date remains the timeline
+        anchor.  That avoids treating unimported historical paperwork as an
+        error during an in-progress rollout.
+        """
+        if not extracted.program:
+            return
+        program = self._entity("program", extracted.program)
+        case_ledger = self._entity("case_ledger", f"{participant['id']} / {extracted.program}")
+        self._relationship("program_documented_for", participant["id"], program["id"], "document_extraction")
+        self._relationship("has_case", participant["id"], case_ledger["id"], "document_extraction")
+        self._event("program_checkpoint_recorded", case_ledger["id"], {
+            "document_id": document["id"], "participant_id": participant["id"], "program_id": program["id"],
+            "document_date": extracted.document_date, "reporting_period": extracted.reporting_period,
+            "enrollment_date": extracted.enrollment_date, "source": "document_extraction",
+        })
+        if extracted.enrollment_date:
+            self._ensure_program_baseline(
+                participant, program, case_ledger, enrollment_date=extracted.enrollment_date,
+                baseline_date=datetime.now(UTC).date().isoformat(), document_id=document["id"], source="periodic_checkpoint",
+            )
+
+    def _ensure_program_baseline(self, participant: dict, program: dict, case_ledger: dict, *, enrollment_date: str, baseline_date: str, document_id: str, source: str) -> None:
+        existing = next((event for event in self.data["ledger_events"] if event["type"] == "program_baseline_established" and event.get("details", {}).get("participant_id") == participant["id"] and event.get("details", {}).get("program_id") == program["id"]), None)
+        if existing:
+            return
+        self._event("program_baseline_established", case_ledger["id"], {
+            "participant_id": participant["id"], "program_id": program["id"], "document_id": document_id,
+            "enrollment_date": enrollment_date, "baseline_date": baseline_date, "source": source,
+        })
 
     def _person_candidates(self) -> list[PersonCandidate]:
         return [
@@ -504,8 +962,58 @@ class HomesteaderStore:
         })
         return {"status": "filed", "document_id": document["id"], "person_id": person["id"], "participant_ledger_id": ledger["id"], "association": association, "reasons": ["Exact HMIS number match or new HMIS identity."]}
 
+    def _record_housing_document(self, document: dict, extracted: ExtractedDocument) -> dict:
+        """File a housing record using only the facts the document actually carries."""
+        if not extracted.participant:
+            return self._review(document, "Housing record has no participant name to associate with a file.")
+        name_matches = [entity for entity in self.data["entities"] if entity["kind"] == "person" and entity["name"].casefold() == extracted.participant.casefold()]
+        if len(name_matches) > 1:
+            return self._review(
+                document,
+                "Housing record names multiple possible participant files. Select the intended participant before filing its relationships.",
+                [{"entity_id": candidate["id"], "name": candidate["name"], "hmis_id": candidate.get("attributes", {}).get("hmis_id")} for candidate in name_matches],
+            )
+        participant = name_matches[0] if name_matches else self._new_entity("person", extracted.participant)
+        return self._file_housing_relationships(
+            document,
+            extracted,
+            participant,
+            association_source="document_extraction" if name_matches else "unique_name_provisional",
+        )
+
+    def _file_housing_relationships(self, document: dict, extracted: ExtractedDocument, participant: dict, *, association_source: str) -> dict:
+        record = self._new_entity(
+            "housing_record",
+            f"{extracted.document_type} / {document['original_name']}",
+            document_id=document["id"], document_date=extracted.document_date,
+        )
+        self._relationship("has_housing_record", participant["id"], record["id"], association_source)
+        property_entity = None
+        if extracted.property_address:
+            property_entity = self._entity("property", extracted.property_address)
+            self._relationship("concerns_property", record["id"], property_entity["id"], association_source)
+            if extracted.unit:
+                unit = self._entity("unit", f"{extracted.property_address} / {extracted.unit}")
+                self._relationship("unit_of", unit["id"], property_entity["id"], association_source)
+                self._relationship("concerns_unit", record["id"], unit["id"], association_source)
+        landlord = None
+        if extracted.landlord:
+            landlord = self._entity("landlord", extracted.landlord)
+            self._relationship("involves_landlord", record["id"], landlord["id"], association_source)
+            if property_entity:
+                self._relationship("landlord_for", landlord["id"], property_entity["id"], association_source)
+        ledger = self._participant_ledger(participant)
+        self._event("housing_document_recorded", ledger["id"], {
+            "document_id": document["id"], "participant_id": participant["id"], "housing_record_id": record["id"],
+            "document_type": extracted.document_type, "document_date": extracted.document_date,
+            "property_id": property_entity["id"] if property_entity else None,
+            "landlord_id": landlord["id"] if landlord else None,
+            "source": association_source,
+        })
+        return {"status": "filed", "document_id": document["id"], "participant_id": participant["id"], "housing_record_id": record["id"], "confidence": 1.0 if association_source == "document_extraction" else 0.8}
+
     def _catalog_form(self, document: dict) -> dict:
-        title = document["source_text"].splitlines()[0].strip().title()
+        title = next((line.strip().title() for line in document["source_text"].splitlines() if line.strip()), document["original_name"])
         form = self._entity("form_template", title)
         self._event("form_cataloged", form["id"], {"document_id": document["id"], "source": "characteristic_classification", "reason": "Blank form title with no completed identity fields."})
         return {"status": "filed", "document_id": document["id"], "form_id": form["id"], "destination": "form_bank", "confidence": 0.95, "reasons": ["Recognized blank form title", "No tenant, premises, or signature fields were completed"]}
@@ -513,12 +1021,46 @@ class HomesteaderStore:
     def _create_lease(self, document: dict, extracted: ExtractedDocument) -> dict:
         if not all([extracted.tenant, extracted.property_address, extracted.unit, extracted.signed_date]):
             return self._review(document, "Lease is missing an identifier required for safe filing.")
-        tenant = self._entity("person", extracted.tenant)
+        name_matches = [entity for entity in self.data["entities"] if entity["kind"] == "person" and entity["name"].casefold() == extracted.tenant.casefold()]
+        if len(name_matches) > 1:
+            return self._review(
+                document,
+                "Lease names multiple possible participant files. Select the intended participant before filing the lease relationship.",
+                [{"entity_id": candidate["id"], "name": candidate["name"], "hmis_id": candidate.get("attributes", {}).get("hmis_id")} for candidate in name_matches],
+            )
+        tenant = name_matches[0] if name_matches else self._new_entity("person", extracted.tenant)
+        return self._file_lease_relationship(
+            document,
+            extracted,
+            tenant,
+            association_source="document_extraction" if name_matches else "unique_name_provisional",
+        )
+
+    def _file_lease_relationship(self, document: dict, extracted: ExtractedDocument, tenant: dict, *, association_source: str) -> dict:
+        """Create the relationship graph once the participant association is safe.
+
+        This is used both by deterministic intake and after a human resolves
+        same-name ambiguity. The source is recorded so a manual selection is
+        never misrepresented as an automatic identity match.
+        """
         property_entity = self._entity("property", extracted.property_address)
         unit = self._entity("unit", f"{extracted.property_address} / {extracted.unit}")
+        self._relationship("unit_of", unit["id"], property_entity["id"], association_source)
+        landlord = self._entity("landlord", extracted.landlord) if extracted.landlord else None
+        if landlord:
+            self._relationship("landlord_for", landlord["id"], property_entity["id"], association_source)
         lease = self._entity("lease", f"{extracted.tenant} / {extracted.property_address} / {extracted.unit} / {extracted.signed_date}")
-        self._event("lease_created", lease["id"], {"document_id": document["id"], "tenant_id": tenant["id"], "property_id": property_entity["id"], "unit_id": unit["id"], "source": "document_extraction"})
-        return {"status": "filed", "document_id": document["id"], "lease_id": lease["id"], "confidence": 1.0, "reasons": ["Lease contains tenant, property, unit, and signing date."]}
+        self._relationship("governs", lease["id"], unit["id"], association_source)
+        self._relationship("tenant_under", tenant["id"], lease["id"], association_source)
+        self._event("lease_created", lease["id"], {
+            "document_id": document["id"], "tenant_id": tenant["id"], "property_id": property_entity["id"],
+            "unit_id": unit["id"], "source": association_source,
+        })
+        reasons = ["Lease contains participant, property, unit, and signing date."]
+        if landlord:
+            reasons.append("Lease identifies a landlord linked to the property.")
+        confidence = 1.0 if association_source == "document_extraction" else 0.8
+        return {"status": "filed", "document_id": document["id"], "lease_id": lease["id"], "participant_id": tenant["id"], "confidence": confidence, "reasons": reasons}
 
     def _link_addendum(self, document: dict, extracted: ExtractedDocument) -> dict:
         required = {"tenant", "property", "unit", "lease_date"}
@@ -549,26 +1091,26 @@ class HomesteaderStore:
         self._event("document_linked", match["id"], {"document_id": document["id"], "relationship_id": relationship["id"], "relationship": "modifies", "source": "deterministic_v0_match"})
         return {"status": "filed", "document_id": document["id"], "lease_id": match["id"], "confidence": 1.0, "reasons": evidence}
 
-    def _review(self, document: dict, reason: str, candidates: list[dict] | None = None) -> dict:
-        item = {"id": str(uuid4()), "document_id": document["id"], "reason": reason, "candidates": candidates or [], "status": "needs_review", "created_at": now()}
+    def _review(self, document: dict, reason: str, candidates: list[dict] | None = None, **details) -> dict:
+        item = {"id": str(uuid4()), "document_id": document["id"], "reason": reason, "category": review_category(reason), "candidates": candidates or [], "status": "needs_review", "created_at": now(), **details}
         self.data["review_queue"].append(item)
         return {"status": "needs_review", "review_id": item["id"], "document_id": document["id"], "reason": reason, "candidates": item["candidates"]}
 
     def _review_existing(self, document: dict, reason: str, intake_occurrence_id: str) -> dict:
-        item = {"id": str(uuid4()), "document_id": document["id"], "intake_occurrence_id": intake_occurrence_id, "reason": reason, "status": "needs_review", "created_at": now()}
+        item = {"id": str(uuid4()), "document_id": document["id"], "intake_occurrence_id": intake_occurrence_id, "reason": reason, "category": review_category(reason), "status": "needs_review", "created_at": now()}
         self.data["review_queue"].append(item)
         return {"status": "needs_review", "document_id": document["id"], "intake_occurrence_id": intake_occurrence_id, "reason": reason}
 
     def pending_reviews(self) -> list[dict]:
         return [item for item in self.data["review_queue"] if item["status"] == "needs_review"]
 
-    def resolve_review(self, review_id: str, action: str, *, entity_id: str | None = None, new_person_name: str | None = None, note: str | None = None) -> dict:
+    def resolve_review(self, review_id: str, action: str, *, entity_id: str | None = None, new_person_name: str | None = None, note: str | None = None, context_note: str | None = None) -> dict:
         item = next((review for review in self.data["review_queue"] if review["id"] == review_id), None)
         if not item:
             raise ValueError(f"Review item '{review_id}' does not exist.")
         if item["status"] != "needs_review":
             raise ValueError(f"Review item '{review_id}' is already resolved.")
-        resolution: dict[str, str | None] = {"action": action, "entity_id": entity_id, "note": note}
+        resolution: dict[str, str | None] = {"action": action, "entity_id": entity_id, "note": note, "context_note": context_note}
         person: dict | None = None
         if action == "assign_existing":
             person = next((entity for entity in self.data["entities"] if entity["id"] == entity_id and entity["kind"] == "person"), None)
@@ -579,16 +1121,90 @@ class HomesteaderStore:
                 raise ValueError("create_person requires new_person_name.")
             person = self._new_entity("person", new_person_name)
             resolution["entity_id"] = person["id"]
+        elif action == "catalog_form":
+            pass
+        elif action == "accept_revision":
+            if not item.get("revision_of_document_id"):
+                raise ValueError("accept_revision is only available for a completed-revision proposal.")
         elif action != "leave_unassigned":
-            raise ValueError("Action must be assign_existing, create_person, or leave_unassigned.")
+            raise ValueError("Action must be assign_existing, create_person, catalog_form, accept_revision, or leave_unassigned.")
         item["status"] = "resolved"
         item["resolution"] = resolution
         item["resolved_at"] = now()
         self._event("human_review_resolved", item["document_id"], {"review_id": review_id, **resolution})
+        document = next((entry for entry in self.data["documents"] if entry["id"] == item["document_id"]), None)
+        if document and context_note and context_note.strip():
+            annotation = {
+                "id": str(uuid4()), "text": context_note.strip(), "provenance": "user_context_note",
+                "recorded_at": now(), "review_id": review_id,
+            }
+            document.setdefault("context_annotations", []).append(annotation)
+            self._event("document_context_annotated", document["id"], {
+                "document_id": document["id"], "annotation_id": annotation["id"], "source": "user_context_note",
+            })
+        if action == "catalog_form" and document:
+            form_result = self._catalog_form(document)
+            resolution["form_id"] = form_result["form_id"]
+            item["resolution"] = resolution
+        if action == "accept_revision" and document:
+            prior_id = item["revision_of_document_id"]
+            relationship = {
+                "id": str(uuid4()), "type": "supersedes_for_fields", "from_document_id": document["id"],
+                "to_document_id": prior_id, "fields": item.get("revision_fields", []),
+                "provenance": "human_review", "created_at": now(),
+            }
+            self.data["relationships"].append(relationship)
+            document["accepted_revision_of_document_id"] = prior_id
+            document["authoritative_fields"] = item.get("revision_fields", [])
+            self._event("completed_revision_confirmed", document["id"], {
+                "document_id": document["id"], "prior_document_id": prior_id,
+                "fields": item.get("revision_fields", []), "review_id": review_id, "note": note,
+                "source": "human_review",
+            })
         if person:
             ledger = self._participant_ledger(person)
             self._event("document_manually_assigned", ledger["id"], {
                 "document_id": item["document_id"], "participant_id": person["id"], "review_id": review_id,
                 "action": action, "note": note, "source": "human_review",
             })
+            if document and context_note and context_note.strip():
+                evidence = self._new_entity("context_evidence", f"{document['original_name']} / {document['id']}", document_id=document["id"])
+                self._relationship("has_context_evidence", person["id"], evidence["id"], "human_review")
+                self._link_context_note_entities(evidence, context_note.strip())
+                self._event("context_evidence_linked", evidence["id"], {
+                    "document_id": document["id"], "participant_id": person["id"], "review_id": review_id,
+                    "source": "human_context_note",
+                })
+            if action == "assign_existing" and document:
+                extracted = ExtractedDocument(**document["extracted"])
+                if extracted.document_type == "lease":
+                    lease_result = self._file_lease_relationship(document, extracted, person, association_source="human_review")
+                    self._event("lease_relationship_confirmed", lease_result["lease_id"], {
+                        "document_id": document["id"], "participant_id": person["id"], "review_id": review_id,
+                        "source": "human_review",
+                    })
+                elif extracted.document_type == "housing_record":
+                    record_result = self._file_housing_relationships(document, extracted, person, association_source="human_review")
+                    self._event("housing_relationships_confirmed", record_result["housing_record_id"], {
+                        "document_id": document["id"], "participant_id": person["id"], "review_id": review_id,
+                        "source": "human_review",
+                    })
         return {"status": "resolved", "review_id": review_id, "resolution": resolution}
+
+    def _link_context_note_entities(self, evidence: dict, context_note: str) -> None:
+        """Link only exact, already-known entities explicitly named in context.
+
+        A user note is useful provenance, but it should not create a guessed
+        property or landlord from a vague phrase. Exact known names and clear
+        unit labels are safe enough to record as user-context relationships.
+        """
+        note = context_note.casefold()
+        for entity in self.data["entities"]:
+            if entity["kind"] == "property" and entity["name"].casefold() in note:
+                self._relationship("context_mentions_property", evidence["id"], entity["id"], "user_context_note")
+            elif entity["kind"] == "landlord" and entity["name"].casefold() in note:
+                self._relationship("context_mentions_landlord", evidence["id"], entity["id"], "user_context_note")
+            elif entity["kind"] == "unit":
+                unit_label = entity["name"].rsplit(" / ", 1)[-1].casefold()
+                if unit_label and re.search(rf"\bunit\s+{re.escape(unit_label)}\b", note):
+                    self._relationship("context_mentions_unit", evidence["id"], entity["id"], "user_context_note")
