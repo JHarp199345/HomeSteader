@@ -254,6 +254,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
         selected_packet_id: str | None = None
         queue_worker_active = False
+        watched_file_signatures: dict[str, tuple[int, int]] = {}
         participant_filters = {"query": "", "status": "all", "program": None, "has_lease": False, "date_from": None, "date_to": None}
         correction_filters = {"query": "", "caseworker": None, "program": None, "category": None, "date_from": None, "date_to": None}
 
@@ -390,6 +391,40 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 return
             queue_worker_active = True
             background_tasks.create(run_intake_worker(), name="homesteader-intake-queue")
+
+        def watch_intake_folder() -> None:
+            """Queue stable, unseen scans from the configured local sync folder."""
+            nonlocal selected_packet_id
+            try:
+                items = inspect_inbox(inbox_path)
+            except OSError:
+                return
+            known_hashes = {document["sha256"] for document in store.data["documents"]}
+            stable_sources = []
+            visible_paths = set()
+            for item in items:
+                if item.path.suffix.casefold() not in SUPPORTED_INTAKE_SUFFIXES or item.sha256 in known_hashes:
+                    continue
+                visible_paths.add(str(item.path))
+                stat = item.path.stat()
+                signature = (stat.st_size, stat.st_mtime_ns)
+                previous = watched_file_signatures.get(str(item.path))
+                watched_file_signatures[str(item.path)] = signature
+                if previous == signature:
+                    stable_sources.append(item.path)
+            for path in set(watched_file_signatures) - visible_paths:
+                watched_file_signatures.pop(path, None)
+            if not stable_sources:
+                return
+            packet = selected_packet()
+            if not packet:
+                packet = store.start_intake_packet(f"Synced intake {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                selected_packet_id = packet["id"]
+            jobs = store.queue_intake_sources(packet["id"], stable_sources)
+            if jobs:
+                store.save()
+                start_intake_worker()
+                refresh_workspace()
 
         def refresh_intake_queue() -> None:
             queue_panel.clear()
@@ -1177,6 +1212,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         refresh_workspace()
         if store.intake_job_counts()["waiting"]:
             start_intake_worker()
+        ui.timer(5.0, watch_intake_folder)
 
 
 def main() -> None:
