@@ -2,13 +2,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from homesteader.core import HomesteaderStore
+from homesteader.core import HomesteaderStore, browse_kind_from_query
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class LeaseLinkingTests(unittest.TestCase):
+
+    def test_workplace_search_terms_select_a_category_without_identity_matching(self):
+        self.assertEqual(browse_kind_from_query("PTC"), "person")
+        self.assertEqual(browse_kind_from_query("tenant"), "person")
+        self.assertEqual(browse_kind_from_query("property owner"), "landlord")
+        self.assertEqual(browse_kind_from_query("apartment complex"), "property")
+        self.assertIsNone(browse_kind_from_query("Jasmine Morales"))
 
     def test_intake_jobs_are_persistent_and_claimed_one_at_a_time(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -53,6 +60,20 @@ class LeaseLinkingTests(unittest.TestCase):
         self.assertEqual(directory[0]["entity_id"], property_entity["id"])
         self.assertEqual(reverse[0]["person_id"], participant["id"])
         self.assertNotEqual(property_entity["id"], owner["id"])
+
+    def test_universal_search_connects_landlord_property_and_participant_without_merging_them(self):
+        participant = self.store._new_entity("person", "Jasmine Morales", hmis_id="H-000042")
+        property_entity = self.store._entity("property", "Harbor View Apartments")
+        owner = self.store._entity("landlord", "Harbor View LLC")
+        self.store._relationship("occupies", participant["id"], property_entity["id"], "test")
+        self.store._relationship("landlord_for", owner["id"], property_entity["id"], "test")
+
+        result = self.store.universal_search("Harbor View LLC")
+
+        self.assertEqual(result["entities"][0]["entity_id"], owner["id"])
+        self.assertIn(property_entity["id"], {item["entity_id"] for item in result["related_entities"]})
+        self.assertIn(participant["id"], {item["entity_id"] for item in result["related_entities"]})
+        self.assertEqual([item["person_id"] for item in result["participant_files"]], [participant["id"]])
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = HomesteaderStore(Path(self.temp.name) / "state.json")
@@ -255,6 +276,37 @@ class LeaseLinkingTests(unittest.TestCase):
         result = self.store.ingest(ROOT / "fixtures/completed_consent_missing_participant.txt")
         self.assertEqual(result["status"], "needs_review")
         self.assertIn("participant", result["reason"])
+
+    def test_entity_directory_lists_everything_recorded_by_kind(self):
+        self.store.ingest(ROOT / "fixtures/lease_elena_ramirez.txt")
+
+        landlords = self.store.entity_directory("landlord")
+        properties = self.store.entity_directory("property")
+        people = self.store.entity_directory("person")
+
+        self.assertEqual(len(landlords), 1)
+        self.assertEqual(len(properties), 1)
+        self.assertEqual([person["name"] for person in people], ["Elena Ramirez"])
+        self.assertGreater(landlords[0]["relationship_count"], 0)
+        everything = self.store.entity_directory()
+        self.assertIn("lease", {row["kind"] for row in everything})
+        self.assertNotIn("participant_ledger", {row["kind"] for row in everything})
+
+    def test_entity_network_supports_reverse_lookup_from_landlord_and_property(self):
+        self.store.ingest(ROOT / "fixtures/lease_elena_ramirez.txt")
+        landlord = next(row for row in self.store.entity_directory("landlord"))
+        property_row = next(row for row in self.store.entity_directory("property"))
+
+        landlord_network = self.store.entity_network(landlord["entity_id"])
+        property_network = self.store.entity_network(property_row["entity_id"])
+
+        self.assertIn("Elena Ramirez", [item["name"] for item in landlord_network["connected"].get("person", [])])
+        self.assertIn(property_row["name"], [item["name"] for item in landlord_network["connected"].get("property", [])])
+        self.assertIn("Elena Ramirez", [item["name"] for item in property_network["connected"].get("person", [])])
+        self.assertIn(landlord["name"], [item["name"] for item in property_network["connected"].get("landlord", [])])
+        self.assertTrue(landlord_network["documents"], "the lease naming the landlord should be listed")
+        with self.assertRaises(ValueError):
+            self.store.entity_network("missing-entity-id")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,34 @@ def normalized_entity_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+# These words select a record category for browsing. They are intentionally
+# separate from identity aliases: searching "PTC" shows participant files, but
+# never claims that two people, owners, or properties are the same record.
+BROWSE_KIND_SYNONYMS = {
+    "person": {
+        "ptc", "ptcs", "participant", "participants", "client", "clients",
+        "tenant", "tenants", "person", "people", "resident", "residents",
+    },
+    "landlord": {
+        "landlord", "landlords", "owner", "owners", "property owner",
+        "property owners", "housing provider", "housing providers", "lessor", "lessors",
+    },
+    "property": {
+        "property", "properties", "address", "addresses", "apartment complex",
+        "apartment complexes", "complex", "complexes", "building", "buildings", "site", "sites",
+    },
+    "unit": {"unit", "units", "apartment", "apartments", "suite", "suites"},
+    "program": {"program", "programs", "service", "services"},
+    "lease": {"lease", "leases", "rental agreement", "rental agreements", "tenancy", "tenancies"},
+}
+
+
+def browse_kind_from_query(query: str) -> str | None:
+    """Return a category for a common workplace term, without matching an identity."""
+    needle = normalized_entity_name(query)
+    return next((kind for kind, terms in BROWSE_KIND_SYNONYMS.items() if needle in terms), None)
+
+
 def review_category(reason: str) -> str:
     """Put human work into an actionable queue without relying on a model."""
     lowered = reason.casefold()
@@ -380,6 +408,173 @@ class HomesteaderStore:
                     "matched_names": matched, "aliases": aliases_by_entity.get(entity["id"], []),
                 })
         return sorted(results, key=lambda item: (item["kind"], item["name"].casefold()))
+
+    BROWSABLE_KINDS = ("person", "landlord", "property", "unit", "program", "lease")
+
+    def entity_directory(self, kind: str | None = None) -> list[dict]:
+        """Browse everything the local database has recorded of one kind.
+
+        This answers "which landlords / properties / participants are in here"
+        without requiring the user to remember any name. It lists canonical
+        entities only; similar names remain separate entries.
+        """
+        kinds = (kind,) if kind else self.BROWSABLE_KINDS
+        aliases_by_entity: dict[str, list[str]] = {}
+        for alias in self.data["entity_aliases"]:
+            aliases_by_entity.setdefault(alias["entity_id"], []).append(alias["alias"])
+        degree: dict[str, int] = {}
+        for relationship in self.data["relationships"]:
+            for entity_id in (relationship.get("from_entity_id"), relationship.get("to_entity_id")):
+                if entity_id:
+                    degree[entity_id] = degree.get(entity_id, 0) + 1
+        rows = []
+        for entity in self.data["entities"]:
+            if entity["kind"] not in kinds:
+                continue
+            attributes = entity.get("attributes") or {}
+            rows.append({
+                "entity_id": entity["id"], "name": entity["name"], "kind": entity["kind"],
+                "aliases": aliases_by_entity.get(entity["id"], []),
+                "identifier": attributes.get("hmis_id") or attributes.get("temporary_id"),
+                "relationship_count": degree.get(entity["id"], 0),
+            })
+        return sorted(rows, key=lambda item: (item["kind"], item["name"].casefold()))
+
+    def entity_network(self, entity_id: str) -> dict:
+        """Return one entity with its recorded connections and naming documents.
+
+        This is the reverse lookup for non-participant entities: a landlord
+        shows the tenants and properties recorded with it, and a property
+        shows everyone recorded at that address. Only explicit, recorded
+        relationships are followed; a similar name never adds a connection.
+        """
+        entities = {entity["id"]: entity for entity in self.data["entities"]}
+        entity = entities.get(entity_id)
+        if not entity:
+            raise ValueError("Entity does not exist.")
+        adjacent: dict[str, list[tuple[str, str]]] = {}
+        for relationship in self.data["relationships"]:
+            from_id, to_id = relationship.get("from_entity_id"), relationship.get("to_entity_id")
+            if from_id and to_id:
+                adjacent.setdefault(from_id, []).append((to_id, relationship["type"]))
+                adjacent.setdefault(to_id, []).append((from_id, relationship["type"]))
+        nearby: dict[str, dict] = {}
+        frontier = [(entity_id, 0, [])]
+        visited = {entity_id}
+        while frontier:
+            current, distance, path = frontier.pop(0)
+            if distance >= 4:
+                continue
+            for neighbor_id, relation in adjacent.get(current, []):
+                if neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)
+                neighbor = entities.get(neighbor_id)
+                next_path = [*path, relation]
+                if neighbor and neighbor["kind"] not in {"participant_ledger", "income_ledger", "case_ledger"}:
+                    attributes = neighbor.get("attributes") or {}
+                    nearby[neighbor_id] = {
+                        "entity_id": neighbor_id, "name": neighbor["name"], "kind": neighbor["kind"],
+                        "distance": distance + 1, "path": next_path,
+                        "identifier": attributes.get("hmis_id") or attributes.get("temporary_id"),
+                    }
+                frontier.append((neighbor_id, distance + 1, next_path))
+        connected: dict[str, list[dict]] = {}
+        for item in sorted(nearby.values(), key=lambda entry: (entry["distance"], entry["name"].casefold())):
+            connected.setdefault(item["kind"], []).append(item)
+        searchable_names = {normalized_entity_name(entity["name"])}
+        alias_names = []
+        for alias in self.data["entity_aliases"]:
+            if alias["entity_id"] == entity_id:
+                searchable_names.add(alias["normalized"])
+                alias_names.append(alias["alias"])
+        documents = []
+        for document in self.data["documents"]:
+            extracted = document.get("extracted") or {}
+            stated = [extracted.get("landlord"), extracted.get("property_address"), extracted.get("participant"), extracted.get("tenant")]
+            if any(value and normalized_entity_name(value) in searchable_names for value in stated):
+                documents.append({
+                    "document_id": document["id"], "name": document["original_name"],
+                    "type": extracted.get("document_type", "unknown"),
+                    "document_date": extracted.get("document_date"),
+                })
+        return {
+            "entity_id": entity_id, "name": entity["name"], "kind": entity["kind"],
+            "attributes": entity.get("attributes") or {},
+            "aliases": sorted(alias_names, key=str.casefold),
+            "connected": connected,
+            "documents": sorted(documents, key=lambda item: item["name"].casefold()),
+        }
+
+    def universal_search(self, query: str) -> dict:
+        """Search local entities, connected files, and stored document names together.
+
+        This is an index entry point, not fuzzy identity resolution. Names and
+        confirmed aliases make something findable; relationships remain explicit
+        and a similar name never merges records.
+        """
+        needle = normalized_entity_name(query)
+        empty = {"entities": [], "related_entities": [], "participant_files": [], "documents": []}
+        if not needle:
+            return empty
+        entities = {entity["id"]: entity for entity in self.data["entities"]}
+        starting = {item["entity_id"] for item in self.entity_directory_search(query)}
+        direct_participant_files = self.search_files(query)
+        starting.update(item["person_id"] for item in direct_participant_files)
+        adjacency: dict[str, set[str]] = {}
+        for relationship in self.data["relationships"]:
+            from_id, to_id = relationship.get("from_entity_id"), relationship.get("to_entity_id")
+            if from_id in entities and to_id in entities:
+                adjacency.setdefault(from_id, set()).add(to_id)
+                adjacency.setdefault(to_id, set()).add(from_id)
+        distances = {entity_id: 0 for entity_id in starting if entity_id in entities}
+        frontier = list(distances)
+        while frontier:
+            current = frontier.pop(0)
+            if distances[current] >= 3:
+                continue
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in distances:
+                    distances[neighbor] = distances[current] + 1
+                    frontier.append(neighbor)
+        directory = self.entity_directory_search(query)
+        related = [
+            {"entity_id": entity_id, "name": entities[entity_id]["name"], "kind": entities[entity_id]["kind"], "distance": distance}
+            for entity_id, distance in distances.items()
+            if distance and entity_id in entities
+        ]
+        document_matches = []
+        for document in self.data["documents"]:
+            searchable = " ".join([
+                document.get("original_name", ""),
+                document.get("extracted", {}).get("participant") or "",
+                document.get("extracted", {}).get("tenant") or "",
+                document.get("extracted", {}).get("property_address") or "",
+                document.get("extracted", {}).get("landlord") or "",
+            ])
+            if needle in normalized_entity_name(searchable):
+                document_matches.append({"document_id": document["id"], "name": document["original_name"], "type": document.get("extracted", {}).get("document_type", "unknown")})
+        participant_ids = {item["person_id"] for item in direct_participant_files}
+        participant_ids.update(entity_id for entity_id in distances if entities.get(entity_id, {}).get("kind") == "person")
+        participant_files = []
+        for person_id in participant_ids:
+            person = entities.get(person_id)
+            if not person:
+                continue
+            summary = self.participant_file(person_id)
+            attributes = person.get("attributes", {})
+            participant_files.append({
+                "person_id": person_id, "name": person["name"], "hmis_id": attributes.get("hmis_id"),
+                "temporary_id": attributes.get("temporary_id"),
+                "status": "confirmed" if attributes.get("hmis_id") else "temporary",
+                "document_count": len(summary["documents"]),
+            })
+        return {
+            "entities": directory,
+            "related_entities": sorted(related, key=lambda item: (item["distance"], item["kind"], item["name"].casefold())),
+            "participant_files": sorted(participant_files, key=lambda item: item["name"].casefold()),
+            "documents": sorted(document_matches, key=lambda item: item["name"].casefold()),
+        }
 
     def housing_schedule_status(self, *, as_of: date | None = None) -> list[dict]:
         """Derive standard program obligations without changing any file.

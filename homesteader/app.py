@@ -16,7 +16,7 @@ from nicegui import app, background_tasks, ui
 
 from homesteader.audit import filter_correction_findings
 from homesteader.correction_export import export_correction_report
-from homesteader.core import HomesteaderStore, SUPPORTED_INTAKE_SUFFIXES
+from homesteader.core import HomesteaderStore, SUPPORTED_INTAKE_SUFFIXES, browse_kind_from_query
 from homesteader.inbox import inspect_inbox
 
 
@@ -42,67 +42,243 @@ def find_available_port(preferred_port: int, attempts: int = 100) -> int:
 
 def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
     archive_dir = store.path.parent / "sources"
+    asset_dir = Path(__file__).resolve().parents[1] / "assets"
     archive_dir.mkdir(parents=True, exist_ok=True)
     # This route exists only inside the loopback-only workspace. It exposes
     # original scans to the local browser UI, never to the network.
     app.add_static_files("/homesteader-source", archive_dir)
-    ui.colors(primary="#0f766e", secondary="#475569", accent="#b45309", positive="#15803d", negative="#b91c1c")
+    if asset_dir.exists():
+        app.add_static_files("/homesteader-assets", asset_dir)
+    ui.colors(primary="#1a7f7d", secondary="#d43a2c", accent="#d43a2c", positive="#1a7f7d", negative="#b83a2d")
     ui.add_head_html("""
         <style>
-          body { background: #f7f8f6; color: #17221f; }
-          .page-shell { max-width: 1280px; margin: 0 auto; padding: 24px; }
-          .metric, .panel { background: #fff; border: 1px solid #d9dfd9; border-radius: 8px; padding: 16px; }
-          .metric { min-width: 150px; }
-          .muted { color: #60706a; }
+          @font-face {
+            font-family: "Homesteader Script";
+            src: url("/homesteader-assets/fonts/Lobster-Regular.ttf") format("truetype");
+            font-style: normal;
+            font-weight: 400;
+            font-display: swap;
+          }
+          @font-face {
+            font-family: "Homesteader Display";
+            src: url("/homesteader-assets/fonts/Oswald-Variable.ttf") format("truetype");
+            font-style: normal;
+            font-weight: 200 700;
+            font-display: swap;
+          }
+          :root {
+            --ink: #1c1d1f;
+            --cream: #fbf5e6;
+            --cream-bright: #fdf7e7;
+            --paper: #f2e9d6;
+            --manila: #efe3c6;
+            --red: #d43a2c;
+            --teal: #1a7f7d;
+          }
+          body { background: var(--paper); color: var(--ink); font-family: Arial, Helvetica, sans-serif; }
+          .page-shell { max-width: 1420px; margin: 0 auto; padding: 22px 30px 46px; }
+          .muted { color: #6e6a58; }
+          .display-label { font-family: "Homesteader Display", sans-serif; font-weight: 500; letter-spacing: .04em; }
+          .section-kicker { color: var(--red); font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; font-size: .82rem; }
+          .view-heading { font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .02em; text-transform: uppercase; }
+
+          /* Ink-outline cards with offset print shadow */
+          .panel { background: var(--cream); border: 2px solid var(--ink); border-radius: 14px; padding: 16px 18px; box-shadow: 6px 6px 0 rgba(28,29,31,.85); }
+          .panel-bar { margin: -16px -18px 14px; width: calc(100% + 36px); border-radius: 11px 11px 0 0; border-bottom: 2px solid var(--ink); padding: 9px 18px; color: var(--cream-bright); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+          .bar-teal { background: var(--teal); }
+          .bar-red { background: var(--red); }
+          .panel-bar .bar-title { font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; font-size: 1.02rem; }
+          .bar-btn { background: var(--cream-bright) !important; color: #123c3b !important; border: 2px solid rgba(28,29,31,.9); border-radius: 8px; }
+          .bar-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; text-transform: uppercase; letter-spacing: .06em; font-size: .74rem; }
+
+          /* Masthead */
+          .tagline-caps { font-family: "Homesteader Display", sans-serif; font-weight: 700; text-transform: uppercase; line-height: 1.04; letter-spacing: .015em; }
+          .tagline-script { font-family: "Homesteader Script", cursive; color: var(--red); line-height: 1.1; }
+          .starburst { color: var(--red); }
+          .starburst-teal { color: var(--teal); }
+          .search-anchor { background: var(--cream); border: 2px solid var(--ink); border-radius: 999px; padding: 6px 8px 6px 22px; box-shadow: 5px 5px 0 rgba(28,29,31,.85); }
+          .search-anchor .q-field__control { background: transparent; }
+          .search-anchor .q-field__control:before, .search-anchor .q-field__control:after { display: none; }
+          .workspace-chip { background: var(--teal); color: var(--cream-bright); border: 2px solid var(--ink); border-radius: 12px; box-shadow: 5px 5px 0 rgba(28,29,31,.85); padding: 10px 18px; }
+
+          /* Red filing-cabinet drawer */
+          .app-drawer { background: var(--red); color: var(--cream-bright); border-right: 2px solid var(--ink); }
+          .app-drawer .q-btn, .app-drawer .q-btn .q-btn__content, .app-drawer .q-btn .q-icon { color: var(--cream-bright) !important; border-radius: 8px; justify-content: flex-start; }
+          .app-drawer .q-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; font-weight: 500; letter-spacing: .07em; text-transform: uppercase; font-size: .82rem; }
+          .app-drawer .q-btn:hover { background: rgba(28,29,31,.22); }
+          .drawer-active { background: var(--cream-bright) !important; }
+          .app-drawer .q-btn.drawer-active .q-btn__content, .app-drawer .q-btn.drawer-active .q-icon { color: var(--ink) !important; }
+          .workspace-chip .tagline-script { color: var(--cream-bright); }
+          .badge-circle { width: 108px; height: 108px; border-radius: 9999px; background: var(--cream-bright); border: 3px solid var(--ink); display: flex; align-items: center; justify-content: center; margin: 0 auto; box-shadow: 0 4px 0 rgba(28,29,31,.45); }
+          .wordmark { font-family: "Homesteader Script", cursive; font-weight: 400; letter-spacing: -.02em; line-height: 1; }
+          .scan-card { background: var(--teal); border: 2px solid var(--ink); border-radius: 10px; padding: 10px 12px; box-shadow: 3px 3px 0 rgba(28,29,31,.55); }
+
+          /* Manila folder tabs */
+          .tab-row { align-items: flex-end; gap: 7px; width: 100%; border-bottom: 3px solid var(--ink); padding: 0 8px; flex-wrap: nowrap; overflow-x: auto; }
+          .folder-tab { background: var(--manila); border: 2px solid var(--ink); border-bottom: none; border-radius: 11px 11px 0 0; padding: 8px 16px 7px; cursor: pointer; color: #4a4536; white-space: nowrap; font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; font-size: .8rem; display: flex; align-items: center; gap: 6px; }
+          .folder-tab:hover { background: #f6ecd2; color: var(--ink); }
+          .tab-active-red { background: var(--red) !important; color: var(--cream-bright) !important; }
+          .tab-active-teal { background: var(--teal) !important; color: var(--cream-bright) !important; }
+
+          /* Directory browse chips */
+          .browse-chip { background: var(--manila); border: 2px solid var(--ink); border-radius: 999px; padding: 3px 13px; cursor: pointer; display: flex; align-items: center; gap: 5px; font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; font-size: .72rem; color: #4a4536; }
+          .browse-chip:hover { background: var(--teal); color: var(--cream-bright); }
+
+          /* Stat tiles */
+          .stat-tile { background: var(--cream); border: 2px solid var(--ink); border-radius: 12px; box-shadow: 5px 5px 0 rgba(28,29,31,.85); padding: 13px 16px; display: flex; gap: 14px; align-items: center; flex: 1; min-width: 215px; }
+          .stat-tile-red { background: var(--red); color: var(--cream-bright); }
+          .stat-tile-red .muted { color: rgba(253,247,231,.85); }
+          .icon-disc { min-width: 52px; width: 52px; height: 52px; border-radius: 9999px; background: var(--ink); color: var(--cream-bright); display: flex; align-items: center; justify-content: center; }
+          .stat-number { font-family: "Homesteader Display", sans-serif; font-weight: 700; font-size: 2.35rem; line-height: 1; }
+          .stat-teal-number { color: var(--teal); }
+          .stat-label { font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; font-size: .8rem; }
+
+          /* Dotted ledger leaders */
+          .leader-row { display: flex; align-items: baseline; width: 100%; font-family: "Homesteader Display", sans-serif; font-weight: 500; letter-spacing: .04em; }
+          .leader-dots { flex: 1 1 auto; margin: 0 8px; border-bottom: 3px dotted var(--ink); transform: translateY(-5px); }
+
+          /* Retro buttons */
+          .q-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; letter-spacing: .05em; }
+          .q-btn.retro-primary { background: var(--red) !important; color: var(--cream-bright) !important; border: 2px solid var(--ink); border-radius: 999px; box-shadow: 3px 3px 0 rgba(28,29,31,.85); padding: 4px 20px; }
+          .q-btn.retro-primary .q-btn__content { text-transform: uppercase; font-weight: 600; }
+          .q-btn.retro-secondary { background: var(--cream-bright) !important; color: var(--ink) !important; border: 2px solid var(--ink); border-radius: 999px; padding: 2px 16px; }
+          .q-btn.retro-secondary .q-btn__content { text-transform: uppercase; font-weight: 600; }
+          .q-btn.bar-btn { background: var(--cream-bright) !important; color: #123c3b !important; }
+          .view-all { font-family: "Homesteader Display", sans-serif; font-weight: 600; color: var(--red); cursor: pointer; letter-spacing: .07em; text-transform: uppercase; text-align: center; width: 100%; font-size: .82rem; }
+          .view-all:hover { text-decoration: underline; }
+
+          /* Quick actions */
+          .qa-circle { width: 62px; height: 62px; border-radius: 9999px; background: var(--red) !important; color: var(--cream-bright) !important; border: 2px solid var(--ink); box-shadow: 3px 3px 0 rgba(28,29,31,.85); }
+          .qa-label { font-family: "Homesteader Display", sans-serif; font-weight: 600; font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; text-align: center; }
+
+          /* Dialogs on cream card stock */
+          .q-dialog .q-card { background: var(--cream); border: 2px solid var(--ink); border-radius: 14px; box-shadow: 7px 7px 0 rgba(28,29,31,.6); }
         </style>
     """)
 
-    with ui.header().classes("items-center justify-between bg-white text-slate-900 border-b border-slate-200"):
-        with ui.row().classes("items-center gap-3"):
-            ui.icon("folder_shared", size="26px", color="primary")
-            ui.label("Homesteader").classes("text-xl font-semibold")
-            ui.label("Local workspace").classes("text-sm muted")
-        ui.label("This computer only").classes("text-sm muted")
+    active_view = {"key": "overview"}
+    global_search = {"query": ""}
+    nav_buttons: dict[str, object] = {}
+
+    with ui.left_drawer(value=True).props("behavior=desktop bordered").classes("app-drawer p-4"):
+        with ui.column().classes("w-full items-center gap-1 mb-6"):
+            with ui.element("div").classes("badge-circle"):
+                ui.element("img").props('src="/homesteader-assets/homesteader-cowboy.png"').style("height: 86px; width: auto; object-fit: contain; display: block;")
+            ui.label("Homesteader").classes("wordmark text-4xl mt-2")
+            ui.label("LOCAL WORKSPACE").classes("display-label text-[10px] tracking-widest opacity-90")
+        ui.label("WORKSPACE").classes("display-label text-[10px] tracking-widest opacity-70 mb-1")
+        for key, label, icon in [
+            ("overview", "Dashboard", "home"), ("review", "Errors & Review", "warning"),
+            ("reports", "Correction Reports", "summarize"), ("files", "File Index", "folder_open"),
+            ("packets", "Packets & Intake", "inventory_2"),
+        ]:
+            nav_buttons[key] = ui.button(label, icon=icon, on_click=lambda key=key: set_active_view(key)).props("flat no-caps").classes("w-full mb-1")
+        ui.separator().classes("my-3 opacity-30")
+        ui.label("DATA").classes("display-label text-[10px] tracking-widest opacity-70 mb-1")
+        nav_buttons["forms"] = ui.button("Form Bank", icon="article", on_click=lambda: set_active_view("forms")).props("flat no-caps").classes("w-full mb-1")
+        ui.separator().classes("my-3 opacity-30")
+        ui.label("SYSTEM").classes("display-label text-[10px] tracking-widest opacity-70 mb-1")
+        nav_buttons["queue"] = ui.button("Local queue", icon="sync", on_click=lambda: set_active_view("queue")).props("flat no-caps").classes("w-full mb-1")
+        with ui.column().classes("scan-card w-full gap-0 mt-6"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("folder", size="18px")
+                ui.label("SCAN FOLDER").classes("display-label text-[10px] tracking-widest")
+            ui.label(str(inbox_path)).classes("text-xs opacity-90 break-all")
 
     with ui.column().classes("page-shell w-full gap-5"):
+        with ui.row().classes("w-full items-center gap-6 flex-nowrap"):
+            with ui.column().classes("gap-0 shrink-0"):
+                ui.label("Find it. Connect it.").classes("tagline-caps text-3xl")
+                ui.label("Keep it together.").classes("tagline-caps text-3xl")
+                with ui.row().classes("items-center gap-2 flex-nowrap"):
+                    ui.label("All in One Place.").classes("tagline-script text-3xl")
+                    ui.label("✦").classes("starburst text-2xl")
+            ui.element("div").classes("flex-grow")
+            with ui.column().classes("workspace-chip gap-0 items-start shrink-0"):
+                with ui.row().classes("items-center gap-2 flex-nowrap"):
+                    ui.label("✦").classes("text-base")
+                    ui.label("LOCAL WORKSPACE").classes("display-label text-sm tracking-widest")
+                ui.label("This computer only").classes("tagline-script text-xl")
+
+        relationship_panel = ui.column().classes("w-full gap-2")
+
+        with ui.row().classes("tab-row flex-nowrap") as tab_bar:
+            tab_elements: dict[str, object] = {}
+            for key, label, icon in [
+                ("review", "Needs Review", "warning"), ("reports", "Correction Findings", "summarize"),
+                ("files", "File Index", "folder_open"), ("packets", "Packets & Intake", "inventory_2"),
+                ("forms", "Form Bank", "article"), ("queue", "Local Queue", "sync"),
+            ]:
+                with ui.element("div").classes("folder-tab") as tab:
+                    ui.icon(icon, size="16px")
+                    ui.label(label)
+                tab.on("click", lambda key=key: set_active_view(key))
+                tab_elements[key] = tab
+
         with ui.row().classes("items-center justify-between w-full"):
             with ui.column().classes("gap-0"):
-                ui.label("Intake packets").classes("text-2xl font-semibold")
-                ui.label(f"Scan folder: {inbox_path}").classes("text-sm muted break-all")
-            refresh_button = ui.button(icon="refresh").props("flat round").tooltip("Refresh workspace")
+                view_kicker = ui.label("WORKSPACE").classes("section-kicker")
+                view_title = ui.label("Overview").classes("view-heading text-3xl font-semibold")
+                view_subtitle = ui.label("What needs attention, locally and right now.").classes("text-sm muted")
+            refresh_button = ui.button(icon="refresh", color=None).classes("retro-secondary").props("round").tooltip("Refresh workspace")
 
-        metrics = ui.row().classes("w-full gap-3 flex-wrap")
-        packet_panel = ui.column().classes("panel w-full gap-3")
-        review_panel = ui.column().classes("panel w-full gap-3")
-        correction_panel = ui.column().classes("panel w-full gap-3")
-        queue_panel = ui.column().classes("panel w-full gap-3")
-        detached_panel = ui.column().classes("panel w-full gap-3")
-        relationship_panel = ui.column().classes("panel w-full gap-3")
-        form_bank_panel = ui.column().classes("panel w-full gap-3")
-        participant_panel = ui.column().classes("panel w-full gap-3")
+        metrics = ui.row().classes("w-full gap-4 flex-wrap")
+
+        with ui.row().classes("w-full gap-5 flex-nowrap items-start"):
+            with ui.column().classes("flex-grow min-w-0 gap-5"):
+                packet_panel = ui.column().classes("panel w-full gap-3")
+                review_panel = ui.column().classes("panel w-full gap-3")
+                correction_panel = ui.column().classes("panel w-full gap-3")
+                detached_panel = ui.column().classes("panel w-full gap-3")
+                form_bank_panel = ui.column().classes("panel w-full gap-3")
+                participant_panel = ui.column().classes("panel w-full gap-3")
+            with ui.column().classes("w-[22rem] shrink-0 gap-5") as right_rail:
+                queue_panel = ui.column().classes("panel w-full gap-3")
+                activity_panel = ui.column().classes("panel w-full gap-3")
+                quick_actions_panel = ui.column().classes("panel w-full gap-3")
+
+        with quick_actions_panel:
+            with ui.row().classes("panel-bar bar-teal"):
+                ui.label("Quick Actions").classes("bar-title")
+            with ui.row().classes("w-full justify-around flex-nowrap"):
+                for label, icon, action in [
+                    ("New Packet", "note_add", lambda: open_new_packet_dialog()),
+                    ("Import Files", "drive_folder_upload", lambda: set_active_view("packets")),
+                    ("Export Report", "download", lambda: download_correction_report(
+                        filter_correction_findings(store.correction_findings(), **correction_filters))),
+                    ("Add Client", "person_add", lambda: set_active_view("review")),
+                ]:
+                    with ui.column().classes("items-center gap-1"):
+                        ui.button(icon=icon, color=None, on_click=action).classes("qa-circle").props("round")
+                        ui.label(label).classes("qa-label")
 
         selected_packet_id: str | None = None
         queue_worker_active = False
         participant_filters = {"query": "", "status": "all", "program": None, "has_lease": False, "date_from": None, "date_to": None}
         correction_filters = {"query": "", "caseworker": None, "program": None, "category": None, "date_from": None, "date_to": None}
 
-        def metrics_values() -> list[tuple[str, int]]:
-            open_packets = store.open_intake_packets()
-            pending = store.pending_reviews()
+        def metrics_values() -> list[tuple[str, int, str, str, bool]]:
+            pending = len(store.pending_reviews())
             return [
-                ("Open packets", len(open_packets)),
-                ("Needs review", len(pending)),
-                ("Documents", len(store.data["documents"])),
-                ("Clients", len([item for item in store.data["entities"] if item["kind"] == "person"])),
+                ("Needs Review", pending, "priority_high", "Issues require attention" if pending else "All clear, partner", pending > 0),
+                ("Documents", len(store.data["documents"]), "description", "Preserved locally", False),
+                ("Clients", len([item for item in store.data["entities"] if item["kind"] == "person"]), "groups", "On file", False),
+                ("Open Packets", len(store.open_intake_packets()), "inventory_2", "In progress", False),
             ]
 
         def refresh_metrics() -> None:
             metrics.clear()
             with metrics:
-                for label, value in metrics_values():
-                    with ui.column().classes("metric gap-0"):
-                        ui.label(str(value)).classes("text-2xl font-semibold")
-                        ui.label(label).classes("text-sm muted")
+                for label, value, icon, caption, alert in metrics_values():
+                    tile_class = "stat-tile stat-tile-red" if alert else "stat-tile"
+                    with ui.row().classes(f"{tile_class} flex-nowrap"):
+                        with ui.element("div").classes("icon-disc"):
+                            ui.icon(icon, size="28px")
+                        with ui.column().classes("gap-0"):
+                            with ui.row().classes("items-baseline gap-2 flex-nowrap"):
+                                ui.label(str(value)).classes("stat-number" if alert else "stat-number stat-teal-number")
+                                ui.label(label).classes("stat-label")
+                            ui.label(caption).classes("text-xs muted")
 
         def selected_packet() -> dict | None:
             return next((packet for packet in store.open_intake_packets() if packet["id"] == selected_packet_id), None)
@@ -114,9 +290,9 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 selected_packet_id = packets[0]["id"] if packets else None
             packet_panel.clear()
             with packet_panel:
-                with ui.row().classes("w-full items-center justify-between"):
-                    ui.label("Open packets").classes("text-lg font-semibold")
-                    ui.button("New packet", icon="create_new_folder", on_click=open_new_packet_dialog).props("no-caps")
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Open Packets").classes("bar-title")
+                    ui.button("New packet", icon="create_new_folder", color=None, on_click=open_new_packet_dialog).classes("bar-btn").props("no-caps dense")
                 if not packets:
                     ui.label("No packet is open.").classes("muted")
                     return
@@ -219,8 +395,19 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             queue_panel.clear()
             with queue_panel:
                 counts = store.intake_job_counts()
-                ui.label("Local processing queue").classes("text-lg font-semibold")
-                ui.label(f"Waiting: {counts['waiting']} · Processing: {counts['processing']} · Completed: {counts['completed']} · Needs attention: {counts['failed']}").classes("text-sm muted")
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Local Processing Queue").classes("bar-title")
+                with ui.row().classes("w-full items-center gap-3 flex-nowrap"):
+                    ui.icon("rocket_launch", size="44px").classes("text-secondary shrink-0")
+                    with ui.column().classes("flex-grow min-w-0 gap-1"):
+                        for label, count in [
+                            ("Waiting", counts["waiting"]), ("Processing", counts["processing"]),
+                            ("Completed", counts["completed"]), ("Needs Attention", counts["failed"]),
+                        ]:
+                            with ui.row().classes("leader-row flex-nowrap"):
+                                ui.label(label)
+                                ui.element("div").classes("leader-dots")
+                                ui.label(str(count)).classes("font-semibold")
                 failed = [job for job in store.data["intake_jobs"] if job.get("status") == "failed"][-3:]
                 for job in failed:
                     ui.label(f"{job['source_name']}: {job.get('error', 'Could not process this scan.')}").classes("text-sm text-amber-800")
@@ -246,7 +433,8 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         def refresh_detached() -> None:
             detached_panel.clear()
             with detached_panel:
-                ui.label("Detached documents").classes("text-lg font-semibold")
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Detached Documents").classes("bar-title")
                 packet = selected_packet()
                 documents = [document for document in store.data["documents"] if not document.get("intake_packet_id")]
                 if not documents:
@@ -272,57 +460,64 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         def refresh_reviews() -> None:
             review_panel.clear()
             with review_panel:
-                ui.label("Needs review").classes("text-lg font-semibold")
                 reviews = store.pending_reviews()
+                with ui.row().classes("panel-bar bar-red"):
+                    ui.label("Needs Review").classes("bar-title")
+                    if reviews:
+                        ui.label(f"{len(reviews)} item{'s' if len(reviews) != 1 else ''}").classes("display-label text-sm")
                 if not reviews:
-                    ui.label("Nothing needs review.").classes("muted")
+                    ui.label("Nothing needs review. Take five, partner.").classes("muted")
                 categories = {}
                 for review in reviews:
                     category = review.get("category", "other_review")
                     categories[category] = categories.get(category, 0) + 1
                 if categories:
                     ui.label(" · ".join(f"{label.replace('_', ' ')}: {count}" for label, count in sorted(categories.items()))).classes("text-sm muted")
-                for review in reviews[:12]:
+                shown = reviews if active_view["key"] == "review" else reviews[:4]
+                for review in shown:
                     document = next((item for item in store.data["documents"] if item["id"] == review["document_id"]), None)
-                    with ui.row().classes("w-full items-center justify-between"):
-                        with ui.column().classes("gap-0"):
-                            ui.label(document["original_name"] if document else "Document review").classes("font-medium text-sm")
-                            ui.label(review.get("category", "other_review").replace("_", " ").title()).classes("text-xs text-amber-800")
+                    with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
+                        ui.icon("picture_as_pdf", size="34px").classes("text-secondary shrink-0")
+                        with ui.column().classes("gap-0 flex-grow min-w-0"):
+                            ui.label(document["original_name"] if document else "Document review").classes("font-semibold text-sm")
+                            ui.label(review.get("category", "other_review").replace("_", " ").title()).classes("display-label text-xs text-secondary uppercase tracking-wide")
                             ui.label(review["reason"]).classes("text-sm muted")
-                        ui.button("Review", icon="fact_check", on_click=lambda review=review: open_review_dialog(review)).props("outline no-caps")
+                        ui.button("Review", icon="fact_check", color=None, on_click=lambda review=review: open_review_dialog(review)).classes("retro-secondary shrink-0").props("no-caps dense")
+                if active_view["key"] != "review" and len(reviews) > len(shown):
+                    ui.label(f"View all needs review ({len(reviews)})  ›").classes("view-all").on("click", lambda: set_active_view("review"))
 
         def refresh_correction_findings() -> None:
             correction_panel.clear()
             with correction_panel:
-                with ui.row().classes("w-full items-center justify-between"):
-                    with ui.column().classes("gap-0"):
-                        ui.label("Correction findings").classes("text-lg font-semibold")
-                        ui.label("Evidence-backed issues to resolve or include in the local correction report.").classes("text-sm muted")
-                    with ui.row().classes("gap-1"):
-                        ui.button(icon="filter_list", on_click=open_correction_filters).props("flat round").tooltip("Filter correction findings")
-                        ui.label("Local audit").classes("text-sm muted")
                 findings = filter_correction_findings(store.correction_findings(), **correction_filters)
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Correction Findings").classes("bar-title")
+                    with ui.row().classes("items-center gap-2 flex-nowrap"):
+                        ui.label(f"{len(findings)} finding{'s' if len(findings) != 1 else ''}").classes("display-label text-sm")
+                        ui.button(icon="filter_list", color=None, on_click=open_correction_filters).classes("bar-btn").props("round dense").tooltip("Filter correction findings")
+                        ui.button("View report", icon="summarize", color=None, on_click=lambda findings=findings: open_correction_report(findings)).classes("bar-btn").props("no-caps dense")
+                        ui.button("Export XLSX", icon="download", color=None, on_click=lambda findings=findings: download_correction_report(findings)).classes("bar-btn").props("no-caps dense")
+                ui.label("Evidence-backed issues to resolve or include in the local correction report.").classes("text-sm muted")
                 if not findings:
                     ui.label("No correction findings match the current filters." if any(correction_filters.values()) else "No active correction findings.").classes("muted")
                     return
-                with ui.row().classes("w-full items-center justify-between"):
-                    ui.label(f"{len(findings)} finding{'s' if len(findings) != 1 else ''} shown").classes("text-sm muted")
-                    with ui.row().classes("gap-2"):
-                        ui.button("View report", icon="summarize", on_click=lambda findings=findings: open_correction_report(findings)).props("outline no-caps")
-                        ui.button("Export XLSX", icon="download", on_click=lambda findings=findings: download_correction_report(findings)).props("outline no-caps")
-                for finding in findings[:8]:
-                    with ui.card().classes("w-full border border-slate-200 shadow-none"):
-                        with ui.row().classes("w-full items-start justify-between"):
-                            with ui.column().classes("gap-1"):
-                                ui.label(f"{finding['ptc']} · {finding['category']}").classes("font-medium text-sm")
+                shown = findings if active_view["key"] == "reports" else findings[:4]
+                for finding in shown:
+                    with ui.card().classes("w-full shadow-none").style("background: var(--cream-bright); border: 2px solid var(--ink); border-radius: 10px;"):
+                        with ui.row().classes("w-full items-start justify-between flex-nowrap gap-3"):
+                            ui.icon("picture_as_pdf", size="34px").classes("text-secondary shrink-0")
+                            with ui.column().classes("gap-1 flex-grow min-w-0"):
+                                ui.label(f"{finding['ptc']} · {finding['category']}").classes("font-semibold text-sm")
                                 if finding["document"]:
                                     ui.label(finding["document"]).classes("text-sm muted")
                                 if finding.get("program") or finding.get("finding_date"):
                                     ui.label(" · ".join(part for part in [finding.get("program"), finding.get("finding_date")] if part)).classes("text-xs muted")
                                 ui.label(finding["error"]).classes("text-sm")
-                                ui.label(f"Recommended: {finding['recommendation']}").classes("text-sm text-teal-800")
+                                ui.label(f"Recommended: {finding['recommendation']}").classes("text-sm text-primary font-medium")
                             if finding["document_id"]:
                                 ui.button(icon="visibility", on_click=lambda document_id=finding["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
+                if active_view["key"] != "reports" and len(findings) > len(shown):
+                    ui.label(f"View all correction findings ({len(findings)})  ›").classes("view-all").on("click", lambda: set_active_view("reports"))
 
         def open_correction_filters() -> None:
             all_findings = store.correction_findings()
@@ -391,41 +586,116 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             ui.download(output_path, filename=output_path.name)
             ui.notify(f"Local correction report created with {len(findings)} finding{'s' if len(findings) != 1 else ''}.", type="positive")
 
+        browse_kinds = [
+            ("person", "Participants", "groups"), ("landlord", "Landlords", "badge"),
+            ("property", "Properties", "home"), ("unit", "Units", "meeting_room"),
+            ("program", "Programs", "flag"), ("lease", "Leases", "history_edu"),
+        ]
+        kind_labels = {kind: label for kind, label, _ in browse_kinds}
+
         def refresh_relationship_search() -> None:
             relationship_panel.clear()
             with relationship_panel:
-                ui.label("Relationship search").classes("text-lg font-semibold")
-                ui.label("Search canonical names and confirmed aliases to find connected participant files. Similar names are never silently merged.").classes("text-sm muted")
-                query = ui.input("Landlord or property name").classes("w-full")
+                with ui.row().classes("search-anchor w-full items-center gap-3 flex-nowrap"):
+                    ui.icon("search", size="26px").classes("shrink-0")
+                    query = ui.input(placeholder="Search landlords, properties, participants, files...").props("borderless clearable").classes("flex-grow min-w-0")
+                    search_button = ui.button("Search", color=None).classes("retro-primary shrink-0").props("no-caps")
+                query.value = global_search["query"]
+                directory_counts: dict[str, int] = {}
+                for row in store.entity_directory():
+                    directory_counts[row["kind"]] = directory_counts.get(row["kind"], 0) + 1
+                with ui.row().classes("w-full items-center gap-2 flex-wrap pl-6"):
+                    ui.label("BROWSE EVERYTHING:").classes("display-label text-[10px] tracking-widest muted")
+                    for kind, label, icon in browse_kinds:
+                        with ui.element("div").classes("browse-chip") as chip:
+                            ui.icon(icon, size="14px")
+                            ui.label(f"{label} ({directory_counts.get(kind, 0)})")
+                        chip.on("click", lambda kind=kind: browse_kind(kind))
+                    ui.label("Similar names are never silently merged.").classes("text-xs muted")
                 results = ui.column().classes("w-full gap-2")
 
+                def browse_kind(kind: str) -> None:
+                    keyword = kind_labels[kind].lower()
+                    query.value = keyword
+                    run_search()
+
+                def show_directory(kind: str) -> None:
+                    label = kind_labels[kind]
+                    rows = store.entity_directory(kind)
+                    ui.label(f"Every recorded {label.lower()[:-1] if label.endswith('s') else label.lower()} in this workspace: {len(rows)}").classes("text-sm font-medium")
+                    if not rows:
+                        ui.label(f"No {label.lower()} are recorded yet. They appear here as scanned documents establish them.").classes("text-sm muted")
+                    for row in rows:
+                        with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
+                            with ui.column().classes("gap-0 min-w-0"):
+                                headline = row["name"] + (f" — {row['identifier']}" if row["identifier"] else "")
+                                ui.label(headline).classes("text-sm font-medium")
+                                details = [f"{row['relationship_count']} recorded connection{'s' if row['relationship_count'] != 1 else ''}"]
+                                if row["aliases"]:
+                                    details.append("also searchable as " + ", ".join(row["aliases"]))
+                                ui.label(" · ".join(details)).classes("text-xs muted")
+                            if kind == "person":
+                                ui.button("Open file", icon="folder_open", on_click=lambda person_id=row["entity_id"]: open_participant_file(person_id)).props("flat no-caps dense").classes("shrink-0")
+                            else:
+                                ui.button("Open profile", icon="hub", on_click=lambda entity_id=row["entity_id"]: open_entity_profile(entity_id)).props("flat no-caps dense").classes("shrink-0")
+
                 def run_search() -> None:
+                    global_search["query"] = query.value or ""
                     results.clear()
-                    matches = store.relationship_search(query.value or "")
-                    entities = store.entity_directory_search(query.value or "")
+                    needle = (query.value or "").strip().casefold()
+                    browse_match = browse_kind_from_query(query.value or "")
                     with results:
-                        if not (query.value or "").strip():
-                            ui.label("Enter a landlord or property name.").classes("text-sm muted")
-                        elif not entities:
-                            ui.label("No participant files are linked to that recorded entity yet.").classes("text-sm muted")
+                        if browse_match:
+                            show_directory(browse_match)
+                            return
+                    matches = store.universal_search(query.value or "")
+                    with results:
+                        if not needle:
+                            ui.label("Start with any name, place, identifier, or file name — or browse a category above.").classes("text-sm muted")
+                        elif not any(matches.values()):
+                            ui.label("No local records match that search.").classes("text-sm muted")
                         else:
-                            ui.label("Canonical entities and confirmed aliases").classes("text-sm font-medium")
-                            for entity in entities:
-                                with ui.row().classes("w-full items-center justify-between"):
-                                    with ui.column().classes("gap-0"):
+                            if matches["entities"]:
+                                ui.label("Matched records").classes("text-sm font-medium")
+                            for entity in matches["entities"]:
+                                with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
+                                    with ui.column().classes("gap-0 min-w-0"):
                                         ui.label(f"{entity['name']} ({entity['kind'].replace('_', ' ')})").classes("text-sm")
                                         if entity["aliases"]:
                                             ui.label("Aliases: " + ", ".join(entity["aliases"])).classes("text-xs muted")
-                                    ui.button("Add alias", icon="alternate_email", on_click=lambda entity=entity: open_alias_dialog(entity)).props("flat no-caps")
-                            if matches:
-                                ui.label("Connected participant files").classes("text-sm font-medium mt-2")
-                            for match in matches:
+                                    with ui.row().classes("gap-1 shrink-0"):
+                                        if entity["kind"] == "person":
+                                            ui.button("Open file", icon="folder_open", on_click=lambda entity=entity: open_participant_file(entity["entity_id"])).props("flat no-caps dense")
+                                        else:
+                                            ui.button("Open profile", icon="hub", on_click=lambda entity=entity: open_entity_profile(entity["entity_id"])).props("flat no-caps dense")
+                                        ui.button("Add alias", icon="alternate_email", on_click=lambda entity=entity: open_alias_dialog(entity)).props("flat no-caps dense")
+                            if matches["related_entities"]:
+                                ui.label("Connected records").classes("text-sm font-medium mt-2")
+                            for entity in matches["related_entities"]:
+                                with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
+                                    ui.label(f"{entity['name']} ({entity['kind'].replace('_', ' ')}) · {entity['distance']} relationship step(s)").classes("text-sm muted min-w-0")
+                                    if entity["kind"] == "person":
+                                        ui.button(icon="folder_open", on_click=lambda entity=entity: open_participant_file(entity["entity_id"])).props("flat dense round").classes("shrink-0").tooltip("Open participant file")
+                                    elif entity["kind"] in dict(kind_labels):
+                                        ui.button(icon="hub", on_click=lambda entity=entity: open_entity_profile(entity["entity_id"])).props("flat dense round").classes("shrink-0").tooltip("Open profile")
+                            if matches["participant_files"]:
+                                ui.label("Participant files").classes("text-sm font-medium mt-2")
+                            for match in matches["participant_files"]:
                                 identifier = match["hmis_id"] or match["temporary_id"] or "No identifier yet"
                                 with ui.row().classes("w-full items-center justify-between"):
-                                    ui.label(f"{match['name']} — {identifier} · linked through {match['relationship_distance']} recorded relationship step(s)").classes("text-sm")
+                                    ui.label(f"{match['name']} — {identifier} · {match['document_count']} document(s)").classes("text-sm")
                                     ui.button("Open file", icon="folder_open", on_click=lambda person_id=match["person_id"]: open_participant_file(person_id)).props("flat no-caps")
+                            if matches["documents"]:
+                                ui.label("Matching documents").classes("text-sm font-medium mt-2")
+                            for document in matches["documents"][:12]:
+                                with ui.row().classes("w-full items-center justify-between"):
+                                    ui.label(f"{document['name']} · {document['type'].replace('_', ' ')}").classes("text-sm muted")
+                                    ui.button(icon="visibility", on_click=lambda document_id=document["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
 
-                ui.button("Search relationships", icon="account_tree", on_click=run_search).props("outline no-caps")
+                query.on("keydown.enter", run_search)
+                search_button.on_click(run_search)
+                if global_search["query"]:
+                    run_search()
 
         def open_alias_dialog(entity: dict) -> None:
             with ui.dialog() as dialog, ui.card().classes("w-96"):
@@ -453,7 +723,8 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         def refresh_form_bank() -> None:
             form_bank_panel.clear()
             with form_bank_panel:
-                ui.label("Form Bank").classes("text-lg font-semibold")
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Form Bank").classes("bar-title")
                 ui.label("Reusable blank forms stay here, not in a participant file.").classes("text-sm muted")
                 forms = [entity for entity in store.data["entities"] if entity["kind"] == "form_template"]
                 if not forms:
@@ -469,18 +740,11 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         def refresh_participant_index() -> None:
             participant_panel.clear()
             with participant_panel:
-                with ui.row().classes("w-full items-center justify-between"):
-                    with ui.column().classes("gap-0"):
-                        ui.label("Participant files").classes("text-lg font-semibold")
-                        ui.label("A compact working index, not a dashboard.").classes("text-sm muted")
-                    ui.button(icon="filter_list", on_click=open_participant_filters).props("flat round").tooltip("Filter participant files")
-                search = ui.input("Find a PTC", value=participant_filters["query"]).classes("w-full")
-
-                def update_query() -> None:
-                    participant_filters["query"] = search.value or ""
-                    refresh_participant_index()
-
-                search.on("keydown.enter", update_query)
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Participant Files").classes("bar-title")
+                    ui.button(icon="filter_list", color=None, on_click=open_participant_filters).classes("bar-btn").props("round dense").tooltip("Filter participant files")
+                ui.label("A compact working index, not a dashboard.").classes("text-sm muted")
+                ui.label("Use the universal search above for a specific person, landlord, property, unit, or file. Filters here are for browsing the index.").classes("text-sm muted")
                 rows = store.participant_index(**participant_filters)
                 ui.label(f"{len(rows)} participant file{'s' if len(rows) != 1 else ''}").classes("text-sm muted")
                 if not rows:
@@ -723,6 +987,58 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.button("Create review proposal", icon="document_scanner", on_click=stage).props("no-caps")
             dialog.open()
 
+        def open_entity_profile(entity_id: str) -> None:
+            try:
+                network = store.entity_network(entity_id)
+            except ValueError as error:
+                ui.notify(str(error), type="negative")
+                return
+            group_titles = {
+                "person": "Tenants & participants", "landlord": "Landlords", "property": "Properties",
+                "unit": "Units", "lease": "Leases", "program": "Programs", "housing_move_in": "Move-in workflows",
+            }
+            with ui.dialog() as dialog, ui.card().classes("w-[60rem] max-w-full"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    with ui.column().classes("gap-0"):
+                        ui.label(network["name"]).classes("text-xl font-semibold")
+                        ui.label(network["kind"].replace("_", " ").upper()).classes("section-kicker")
+                    ui.button(icon="close", on_click=dialog.close).props("flat round")
+                if network["aliases"]:
+                    ui.label("Also searchable as: " + ", ".join(network["aliases"])).classes("text-sm muted")
+                recorded_facts = {key: value for key, value in network["attributes"].items() if value}
+                for key, value in recorded_facts.items():
+                    ui.label(f"{key.replace('_', ' ').title()}: {value}").classes("text-sm")
+                ui.label("Recorded connections").classes("font-medium mt-2")
+                ordered_groups = [kind for kind in ("person", "landlord", "property", "unit", "lease", "program") if network["connected"].get(kind)]
+                extra_groups = [kind for kind in network["connected"] if kind not in ordered_groups and network["connected"][kind]]
+                if not ordered_groups and not extra_groups:
+                    ui.label("No recorded relationships yet. Connections appear as documents establish them.").classes("text-sm muted")
+                with ui.row().classes("w-full gap-6 flex-wrap"):
+                    for kind in [*ordered_groups, *extra_groups]:
+                        with ui.column().classes("gap-1 min-w-[16rem]"):
+                            ui.label(group_titles.get(kind, kind.replace("_", " ").title())).classes("font-medium text-sm")
+                            for item in network["connected"][kind]:
+                                with ui.row().classes("items-center gap-1 flex-nowrap"):
+                                    with ui.column().classes("gap-0 min-w-0"):
+                                        headline = item["name"] + (f" — {item['identifier']}" if item["identifier"] else "")
+                                        ui.label(headline).classes("text-sm")
+                                        ui.label(" → ".join(part.replace("_", " ") for part in item["path"])).classes("text-xs muted")
+                                    if kind == "person":
+                                        ui.button(icon="folder_open", on_click=lambda person_id=item["entity_id"]: open_participant_file(person_id)).props("flat dense round").tooltip("Open participant file")
+                                    else:
+                                        ui.button(icon="hub", on_click=lambda linked_id=item["entity_id"]: open_entity_profile(linked_id)).props("flat dense round").tooltip("Open profile")
+                ui.label("Documents naming this record").classes("font-medium mt-3")
+                if not network["documents"]:
+                    ui.label("No stored document states this name directly; connections above may come from related records.").classes("text-sm muted")
+                for document in network["documents"]:
+                    detail = document["type"].replace("_", " ")
+                    if document.get("document_date"):
+                        detail += f" · {document['document_date']}"
+                    with ui.row().classes("items-center gap-1 flex-nowrap"):
+                        ui.label(f"{document['name']} ({detail})").classes("text-sm min-w-0")
+                        ui.button(icon="visibility", on_click=lambda document_id=document["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
+            dialog.open()
+
         def open_participant_file(person_id: str) -> None:
             summary = store.participant_file(person_id)
             attributes = summary["attributes"]
@@ -779,6 +1095,70 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.label(f"{event['type'].replace('_', ' ')} · {event.get('recorded_at', '')}").classes("text-sm")
             dialog.open()
 
+        def refresh_activity() -> None:
+            activity_panel.clear()
+            with activity_panel:
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Recent Activity").classes("bar-title")
+                events = list(reversed(store.data.get("ledger_events", [])))[:4]
+                if not events:
+                    ui.label("No recorded activity yet.").classes("muted")
+                icons = {
+                    "review_opened": "schedule", "review_resolved": "task_alt", "document_ingested": "download",
+                    "duplicate_detected": "content_copy", "packet_opened": "create_new_folder", "packet_closed": "task_alt",
+                }
+                for event in events:
+                    recorded = (event.get("recorded_at") or "")[:10]
+                    with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+                        ui.icon(icons.get(event.get("type", ""), "history"), size="20px").classes("text-secondary shrink-0")
+                        with ui.column().classes("gap-0 min-w-0"):
+                            ui.label(event.get("type", "event").replace("_", " ").title()).classes("text-sm font-medium")
+                            if recorded:
+                                ui.label(recorded).classes("text-xs muted")
+
+        def set_active_view(key: str) -> None:
+            active_view["key"] = key
+            refresh_workspace()
+
+        def apply_active_view() -> None:
+            key = active_view["key"]
+            labels = {
+                "overview": ("WORKSPACE", "Overview", "What needs attention, locally and right now."),
+                "review": ("WORKSPACE", "Errors & Review", "Resolve uncertain records with the original evidence in view."),
+                "reports": ("DATA QUALITY", "Correction Reports", "Exportable, evidence-backed correction work."),
+                "files": ("RECORDS", "File Index", "Browse participant records; use universal search to navigate the whole relationship network."),
+                "packets": ("INTAKE", "Packets & Intake", "Bring unsorted records into a coherent local packet."),
+                "forms": ("DATA", "Form Bank", "Reusable blank forms, kept separate from participant files."),
+                "queue": ("SYSTEM", "Local Queue", "Private, on-device processing status."),
+            }
+            kicker, title, subtitle = labels[key]
+            view_kicker.set_text(kicker)
+            view_title.set_text(title)
+            view_subtitle.set_text(subtitle)
+            metrics.visible = key == "overview"
+            review_panel.visible = key in {"overview", "review"}
+            correction_panel.visible = key in {"overview", "reports"}
+            right_rail.visible = key in {"overview", "queue"}
+            queue_panel.visible = True
+            activity_panel.visible = key == "overview"
+            quick_actions_panel.visible = key == "overview"
+            packet_panel.visible = key == "packets"
+            detached_panel.visible = key == "packets"
+            form_bank_panel.visible = key == "forms"
+            participant_panel.visible = key == "files"
+            relationship_panel.visible = True
+            for button_key, button in nav_buttons.items():
+                if button_key == key:
+                    button.classes(add="drawer-active")
+                else:
+                    button.classes(remove="drawer-active")
+            for tab_key, tab in tab_elements.items():
+                active_class = "tab-active-red" if tab_key == "review" else "tab-active-teal"
+                if tab_key == key:
+                    tab.classes(add=active_class)
+                else:
+                    tab.classes(remove="tab-active-red tab-active-teal")
+
         def refresh_workspace() -> None:
             refresh_metrics()
             refresh_packets()
@@ -789,6 +1169,8 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             refresh_relationship_search()
             refresh_form_bank()
             refresh_participant_index()
+            refresh_activity()
+            apply_active_view()
 
         refresh_button.on_click(refresh_workspace)
         ui.timer(1.5, refresh_intake_queue)
