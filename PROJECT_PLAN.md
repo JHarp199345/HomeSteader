@@ -47,6 +47,13 @@ program relationship and record an enrollment date without causing the system
 to report every unimported historical form as missing. Schedule audits begin
 after that baseline.
 
+Program duration and recurring-document rules must be visible, local, and
+editable—not buried in application code. A fresh intake can arrive across
+multiple scans, so an enrollment discovered inside an open intake packet does
+not activate schedule auditing until the packet is deliberately closed. This
+prevents a half-scanned packet from producing misleading missing-document
+findings.
+
 Due-diligence forms are event-triggered evidence of a caseworker's effort to
 obtain a document, make contact, or address a situation. They are never a
 missing scheduled requirement.
@@ -159,6 +166,14 @@ Each fact and relationship records its origin:
 
 Every automated relationship includes model/provider, confidence, evidence, timestamp, and correction history. The original document is immutable; generated metadata can be detached, relinked, merged, split, or reverted.
 
+### Canonical entities, aliases, and reverse lookup
+
+Canonical entities remain distinct even when their names overlap: a property,
+an LLC that owns it, and a manager are linked entities rather than a fuzzy name
+merge. Human-confirmed aliases create reliable alternate search entry points.
+Candidate relationships must be supported by address, unit, contact, document,
+or prior recorded evidence and remain reviewable.
+
 ## AI-provider adapters
 
 The Homesteader core sends structured tasks to an adapter and requires structured, evidence-based results. It must work with local and optional cloud models rather than requiring a particular provider.
@@ -243,8 +258,8 @@ Create an intentionally unclear document: missing unit number, vague agreement r
 - Add name-first participant-file search: show temporary and HMIS-confirmed files by name, open their evidence summaries, then let the human attach an ambiguous document or create a new provisional file. Users should never need to remember a temporary identifier.
 - Support direct search and source-cited conversational retrieval.
 - Generate standardized names and dynamic folder-like views without requiring folders as the primary model.
-- Add a local correction-report audit: translate unresolved review items, temporary identities, source-archive gaps, and other evidence-backed data-quality problems into per-caseworker/PTC findings with a plain-language correction recommendation.
-- Export correction reports as a readable Excel/Google Sheets-compatible workbook plus a machine-readable audit-data sheet. The audit must never alter source records or invent external-system discrepancies.
+- Implemented: a local correction-report audit translates unresolved review items, temporary identities, source-archive gaps, and other evidence-backed data-quality problems into per-caseworker/PTC findings with a plain-language correction recommendation.
+- Implemented: the workspace filters those findings and exports the selected local rows as a readable Excel/Google Sheets-compatible workbook plus a machine-readable audit-data sheet. The audit never alters source records or invents external-system discrepancies.
 
 ### Phase 3 — Context capture and maintenance workflow
 
@@ -263,6 +278,21 @@ Create an intentionally unclear document: missing unit number, vague agreement r
 - Compare models on the same fictional scans for legibility, evidence quality,
   uncertainty reporting, and unsupported-fact rate before using one with
   approved workplace records.
+
+### Housing Services capability — move-in workflow
+
+- Implement the editable, source-derived move-in packet definition: assistance
+  request, landlord acknowledgement, unit/owner certification, W-9, lease,
+  ownership verification, and habitability record; add the authorization
+  letter and landlord incentive agreement only when their stated conditions
+  apply.
+- Let any of those records open or attach to the same move-in workflow in any
+  order. Check shared property/unit, participant, rent, deposit, term,
+  move-in-date, owner/payee, and signer facts without overwriting a conflict.
+- Keep legal owner, payee, manager, and authorized representative as linked
+  entities rather than assuming identical names. Keep destination-specific
+  readiness rules disabled until the organization's actual HMIS and Accounting
+  checklists are confirmed.
 
 ### Phase 4 — Provider and connector expansion
 

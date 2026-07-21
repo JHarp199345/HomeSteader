@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -15,7 +16,8 @@ from .audit import correction_findings
 from .case_management import DOCUMENT_RULES
 from .entity_resolution import IdentityDecision, PersonCandidate, resolve_person
 from .extraction import extract_common_facts
-from .housing_services import add_months, schedule_for_program
+from .housing_services import add_months, load_program_schedules, schedule_for_program, write_default_program_schedules
+from .move_in import core_record_keys, load_move_in_definition, record_keys, write_default_move_in_definition
 from .ocr import recognize_image_with_vision, recognize_pdf_with_vision
 from .proposals import AIProposal, validate_proposal
 
@@ -36,6 +38,11 @@ def normalized_content_hash(text: str) -> str:
     """
     normalized = re.sub(r"[^a-z0-9]+", "", text.lower())
     return sha256(normalized.encode()).hexdigest()
+
+
+def normalized_entity_name(value: str) -> str:
+    """Normalize presentation differences without asserting two entities match."""
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
 def review_category(reason: str) -> str:
@@ -78,6 +85,14 @@ class ExtractedDocument:
     emergency_contact: str | None = None
     hmis_id: str | None = None
     referenced_lease_date: str | None = None
+    monthly_rent: str | None = None
+    security_deposit: str | None = None
+    move_in_date: str | None = None
+    lease_term: str | None = None
+    legal_owner: str | None = None
+    payee: str | None = None
+    property_manager: str | None = None
+    signer: str | None = None
 
 
 def find_value(label: str, text: str) -> str | None:
@@ -93,8 +108,34 @@ def extract_document(text: str) -> ExtractedDocument:
     document_type = "unknown"
     signature = find_value("Signature", text) or find_value("Signed", text)
     has_nonblank_signature = bool(signature and signature.replace("_", "").strip())
-    has_completed_identity = bool(value("tenant") or value("participant") or find_value("Premises", text) or has_nonblank_signature)
-    if "INCOME DECLARATION" in upper:
+    has_completed_identity = bool(
+        value("tenant") or value("participant") or find_value("Premises", text)
+        or find_value("Property address", text) or find_value("Payee name", text)
+        or find_value("Legal owner", text) or has_nonblank_signature
+    )
+    move_in_type = None
+    if "MOVE-IN ASSISTANCE REQUEST" in upper:
+        move_in_type = "move_in_assistance_request"
+    elif "LANDLORD RENTAL ASSISTANCE ACKNOWLEDGEMENT" in upper:
+        move_in_type = "landlord_rental_assistance_acknowledgement"
+    elif "UNIT INFORMATION AND OWNER CERTIFICATIONS" in upper:
+        move_in_type = "unit_information_owner_certification"
+    elif "REQUEST FOR TAXPAYER IDENTIFICATION NUMBER AND CERTIFICATION" in upper or "FORM W-9" in upper:
+        move_in_type = "w9"
+    elif "LETTER OF AUTHORIZATION" in upper and "AUTHORIZED TO SIGN" in upper:
+        move_in_type = "letter_of_authorization"
+    elif "LANDLORD INCENTIVE FEE AGREEMENT FORM" in upper:
+        move_in_type = "landlord_incentive_fee_agreement"
+    elif "HABITABILITY STANDARDS FOR PERMANENT HOUSING" in upper:
+        move_in_type = "habitability_standards"
+    elif "OWNERSHIP VERIFICATION" in upper and "ASSESSOR" in upper:
+        move_in_type = "ownership_verification"
+
+    if move_in_type and not has_completed_identity:
+        document_type = "form_template"
+    elif move_in_type:
+        document_type = move_in_type
+    elif "INCOME DECLARATION" in upper:
         document_type = "income_declaration"
     elif "HOUSEHOLD COMPOSITION & INCOME ELIGIBILITY" in upper or "MYORG CALCULATOR" in upper or "INCOME VERIFICATION" in upper:
         document_type = "income_verification"
@@ -109,7 +150,7 @@ def extract_document(text: str) -> ExtractedDocument:
     elif "CONSENT TO SHARE PROTECTED PERSONAL INFORMATION" in upper:
         document_type = "consent_to_share"
     elif any(marker in upper for marker in {
-        "MOVE-IN ASSISTANCE REQUEST", "RENT REASONABLENESS", "LANDLORD COMMUNICATION",
+        "RENT REASONABLENESS", "LANDLORD COMMUNICATION",
         "HOUSING RETENTION PLAN", "HOUSING SEARCH PLAN",
     }):
         document_type = "housing_record"
@@ -148,14 +189,26 @@ def extract_document(text: str) -> ExtractedDocument:
         emergency_contact=value("emergency_contact"),
         hmis_id=value("hmis_id"),
         referenced_lease_date=referenced.group(1) if referenced else None,
+        monthly_rent=find_value("Monthly rent", text) or find_value("Requested rent", text) or find_value("Tenant monthly rental amount", text),
+        security_deposit=find_value("Security deposit", text),
+        move_in_date=find_value("Move-in date", text) or find_value("Date available for move-in", text),
+        lease_term=find_value("Lease term", text),
+        legal_owner=find_value("Legal owner", text) or find_value("Name of legal owner", text),
+        payee=find_value("Payee name", text) or find_value("Checks payable to", text),
+        property_manager=find_value("Property manager", text) or find_value("Management company", text),
+        signer=find_value("Signer", text) or find_value("Landlord/owner signature", text),
     )
 
 
 class HomesteaderStore:
     """Small JSON-backed store. Events are appended; original source is preserved."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, program_rules_path: Path | None = None, move_in_rules_path: Path | None = None):
         self.path = path
+        self.program_rules_path = program_rules_path or path.parent / "program_rules.json"
+        self.program_schedules = load_program_schedules(self.program_rules_path)
+        self.move_in_rules_path = move_in_rules_path or path.parent / "move_in_packet.json"
+        self.move_in_definition = load_move_in_definition(self.move_in_rules_path)
         self.data = self._load()
 
     def _load(self) -> dict:
@@ -165,8 +218,15 @@ class HomesteaderStore:
             data.setdefault("intake_packets", [])
             data.setdefault("counters", {"temporary_file": 0})
             data.setdefault("ai_proposals", [])
+            data.setdefault("intake_jobs", [])
+            data.setdefault("entity_aliases", [])
+            data.setdefault("move_in_workflows", [])
+            for job in data["intake_jobs"]:
+                if job.get("status") == "processing":
+                    job["status"] = "waiting"
+                    job["recovered_at"] = now()
             return data
-        return {"documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "ai_proposals": [], "counters": {"temporary_file": 0}}
+        return {"documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "ai_proposals": [], "intake_jobs": [], "entity_aliases": [], "move_in_workflows": [], "counters": {"temporary_file": 0}}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +235,151 @@ class HomesteaderStore:
     def correction_findings(self) -> list[dict]:
         """Audit local record quality without altering records or calling a service."""
         return correction_findings(self)
+
+    def initialize_program_rules(self) -> Path:
+        """Write the local editable rules template once; never overwrite it."""
+        if not self.program_rules_path.exists():
+            write_default_program_schedules(self.program_rules_path)
+        self.program_schedules = load_program_schedules(self.program_rules_path)
+        return self.program_rules_path
+
+    def initialize_move_in_rules(self) -> Path:
+        """Create the editable move-in workflow rules template once."""
+        if not self.move_in_rules_path.exists():
+            write_default_move_in_definition(self.move_in_rules_path)
+        self.move_in_definition = load_move_in_definition(self.move_in_rules_path)
+        return self.move_in_rules_path
+
+    def move_in_workflow_status(self, workflow_id: str | None = None) -> list[dict]:
+        """Return local move-in readiness without making an external decision."""
+        core = core_record_keys(self.move_in_definition)
+        rows = []
+        for workflow in self.data["move_in_workflows"]:
+            if workflow_id and workflow["id"] != workflow_id:
+                continue
+            present = set(workflow.get("record_types", []))
+            missing = sorted(core - present)
+            claims_by_field: dict[str, list[dict]] = {}
+            for claim in workflow.get("fact_claims", []):
+                claims_by_field.setdefault(claim["field"], []).append(claim)
+            conflicts = []
+            for field, claims in claims_by_field.items():
+                values = {claim["normalized_value"] for claim in claims if claim.get("normalized_value")}
+                if len(values) > 1:
+                    conflicts.append({
+                        "field": field,
+                        "values": sorted({claim["value"] for claim in claims}),
+                        "document_ids": sorted({claim["document_id"] for claim in claims}),
+                    })
+            rows.append({
+                **workflow,
+                "present_record_types": sorted(present),
+                "missing_record_types": missing,
+                "conflicts": conflicts,
+                "status": "needs_review" if conflicts else ("complete_for_local_review" if not missing else "in_progress"),
+            })
+        return rows
+
+    def queue_intake_sources(self, packet_id: str, sources: list[Path]) -> list[dict]:
+        """Persist local intake jobs without moving or transmitting any source."""
+        packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None)
+        if not packet or packet.get("status", "open") != "open":
+            raise ValueError("Open a packet before queueing scans.")
+        queued = []
+        existing = {
+            (item.get("packet_id"), item.get("source_path")) for item in self.data["intake_jobs"]
+            if item.get("status") in {"waiting", "processing"}
+        }
+        for source in sources:
+            key = (packet_id, str(source))
+            if key in existing:
+                continue
+            job = {
+                "id": str(uuid4()), "packet_id": packet_id, "source_path": str(source),
+                "source_name": source.name, "status": "waiting", "queued_at": now(),
+            }
+            self.data["intake_jobs"].append(job)
+            queued.append(job)
+        return queued
+
+    def claim_next_intake_job(self) -> dict | None:
+        """Claim one waiting job so only one local worker processes it."""
+        job = next((item for item in self.data["intake_jobs"] if item.get("status") == "waiting"), None)
+        if not job:
+            return None
+        job["status"] = "processing"
+        job["started_at"] = now()
+        return job
+
+    def finish_intake_job(self, job_id: str, *, result: dict | None = None, error: str | None = None) -> dict:
+        job = next((item for item in self.data["intake_jobs"] if item["id"] == job_id), None)
+        if not job:
+            raise ValueError("Intake job does not exist.")
+        job["status"] = "failed" if error else "completed"
+        job["finished_at"] = now()
+        if result is not None:
+            job["result"] = result
+        if error:
+            job["error"] = error
+        return job
+
+    def intake_job_counts(self) -> dict[str, int]:
+        counts = {"waiting": 0, "processing": 0, "completed": 0, "failed": 0}
+        for job in self.data["intake_jobs"]:
+            status = job.get("status")
+            if status in counts:
+                counts[status] += 1
+        return counts
+
+    def add_entity_alias(self, entity_id: str, alias: str, *, source: str = "human_confirmed", note: str | None = None) -> dict:
+        """Record a confirmed alternate name without merging entities.
+
+        An alias is only a second way to find one canonical entity. It does not
+        assert that a similarly named property, LLC, manager, or contact is the
+        same entity. Those connections remain explicit relationships.
+        """
+        entity = next((item for item in self.data["entities"] if item["id"] == entity_id), None)
+        if not entity:
+            raise ValueError("Entity does not exist.")
+        cleaned = alias.strip()
+        if not cleaned:
+            raise ValueError("An alias cannot be blank.")
+        normalized = normalized_entity_name(cleaned)
+        conflicts = [
+            item for item in self.data["entity_aliases"]
+            if item["entity_id"] != entity_id and item["entity_kind"] == entity["kind"] and item["normalized"] == normalized
+        ]
+        if conflicts:
+            raise ValueError("That alias is already confirmed for another entity of the same type; review the relationship instead of merging them.")
+        existing = next((item for item in self.data["entity_aliases"] if item["entity_id"] == entity_id and item["normalized"] == normalized), None)
+        if existing:
+            return existing
+        record = {
+            "id": str(uuid4()), "entity_id": entity_id, "entity_kind": entity["kind"],
+            "alias": cleaned, "normalized": normalized, "source": source, "note": note, "created_at": now(),
+        }
+        self.data["entity_aliases"].append(record)
+        self._event("entity_alias_confirmed", entity_id, {"alias_id": record["id"], "alias": cleaned, "source": source, "note": note})
+        return record
+
+    def entity_directory_search(self, query: str) -> list[dict]:
+        """Search canonical names and human-confirmed aliases, never fuzzy merges."""
+        needle = normalized_entity_name(query)
+        if not needle:
+            return []
+        aliases_by_entity: dict[str, list[str]] = {}
+        for alias in self.data["entity_aliases"]:
+            aliases_by_entity.setdefault(alias["entity_id"], []).append(alias["alias"])
+        results = []
+        for entity in self.data["entities"]:
+            names = [entity["name"], *aliases_by_entity.get(entity["id"], [])]
+            matched = [name for name in names if needle in normalized_entity_name(name)]
+            if matched:
+                results.append({
+                    "entity_id": entity["id"], "name": entity["name"], "kind": entity["kind"],
+                    "matched_names": matched, "aliases": aliases_by_entity.get(entity["id"], []),
+                })
+        return sorted(results, key=lambda item: (item["kind"], item["name"].casefold()))
 
     def housing_schedule_status(self, *, as_of: date | None = None) -> list[dict]:
         """Derive standard program obligations without changing any file.
@@ -201,7 +406,12 @@ class HomesteaderStore:
                 baseline = date.fromisoformat(baseline_date)
             except ValueError:
                 continue
-            schedule = schedule_for_program(program["name"])
+            source_document = documents.get(details.get("document_id"))
+            packet_id = (source_document or {}).get("intake_packet_id")
+            packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None) if packet_id else None
+            if packet and packet.get("status", "open") == "open":
+                continue
+            schedule = schedule_for_program(program["name"], self.program_schedules)
             if not schedule:
                 continue
             exit_events = [
@@ -471,7 +681,7 @@ class HomesteaderStore:
         if not needle:
             return []
         entities = {entity["id"]: entity for entity in self.data["entities"]}
-        starting_ids = [entity_id for entity_id, entity in entities.items() if needle in entity["name"].casefold()]
+        starting_ids = [item["entity_id"] for item in self.entity_directory_search(query)]
         adjacent: dict[str, set[str]] = {}
         for relationship in self.data["relationships"]:
             from_id = relationship.get("from_entity_id")
@@ -622,7 +832,7 @@ class HomesteaderStore:
             return self._record_income_declaration(document, extracted)
         if extracted.document_type == "contact_information":
             return self._record_contact_information(document, extracted)
-        if extracted.document_type == "housing_record":
+        if extracted.document_type == "housing_record" or extracted.document_type in record_keys(self.move_in_definition):
             return self._record_housing_document(document, extracted)
         if extracted.document_type in {"program_enrollment", "consent_to_share", "program_exit"}:
             return self._record_case_document(document, extracted)
@@ -988,7 +1198,7 @@ class HomesteaderStore:
             document_id=document["id"], document_date=extracted.document_date,
         )
         self._relationship("has_housing_record", participant["id"], record["id"], association_source)
-        property_entity = None
+        property_entity = unit = None
         if extracted.property_address:
             property_entity = self._entity("property", extracted.property_address)
             self._relationship("concerns_property", record["id"], property_entity["id"], association_source)
@@ -1010,7 +1220,17 @@ class HomesteaderStore:
             "landlord_id": landlord["id"] if landlord else None,
             "source": association_source,
         })
-        return {"status": "filed", "document_id": document["id"], "participant_id": participant["id"], "housing_record_id": record["id"], "confidence": 1.0 if association_source == "document_extraction" else 0.8}
+        workflow = self._attach_move_in_workflow(
+            document, extracted, participant,
+            property_id=property_entity["id"] if property_entity else None,
+            unit_id=unit["id"] if unit else None,
+            association_source=association_source,
+        )
+        return {
+            "status": "filed", "document_id": document["id"], "participant_id": participant["id"],
+            "housing_record_id": record["id"], "move_in_workflow_id": workflow["id"] if workflow else None,
+            "confidence": 1.0 if association_source == "document_extraction" else 0.8,
+        }
 
     def _catalog_form(self, document: dict) -> dict:
         title = next((line.strip().title() for line in document["source_text"].splitlines() if line.strip()), document["original_name"])
@@ -1056,11 +1276,103 @@ class HomesteaderStore:
             "document_id": document["id"], "tenant_id": tenant["id"], "property_id": property_entity["id"],
             "unit_id": unit["id"], "source": association_source,
         })
+        workflow = self._attach_move_in_workflow(
+            document, extracted, tenant, property_id=property_entity["id"], unit_id=unit["id"],
+            association_source=association_source,
+        )
         reasons = ["Lease contains participant, property, unit, and signing date."]
         if landlord:
             reasons.append("Lease identifies a landlord linked to the property.")
         confidence = 1.0 if association_source == "document_extraction" else 0.8
-        return {"status": "filed", "document_id": document["id"], "lease_id": lease["id"], "participant_id": tenant["id"], "confidence": confidence, "reasons": reasons}
+        return {
+            "status": "filed", "document_id": document["id"], "lease_id": lease["id"],
+            "participant_id": tenant["id"], "move_in_workflow_id": workflow["id"] if workflow else None,
+            "confidence": confidence, "reasons": reasons,
+        }
+
+    def _attach_move_in_workflow(
+        self, document: dict, extracted: ExtractedDocument, participant: dict, *,
+        property_id: str | None, unit_id: str | None, association_source: str,
+    ) -> dict | None:
+        """Attach one recognized record to a participant's local move-in workflow.
+
+        This intentionally uses only the participant plus recorded property/unit
+        context. A W-9 or ownership record without safe participant context stays
+        available for review rather than being attached to a guessed move-in.
+        """
+        eligible_types = record_keys(self.move_in_definition) | {"lease"}
+        if extracted.document_type not in eligible_types:
+            return None
+        candidates = [
+            workflow for workflow in self.data["move_in_workflows"]
+            if workflow.get("participant_id") == participant["id"]
+            and (not property_id or not workflow.get("property_id") or workflow.get("property_id") == property_id)
+            and (not unit_id or not workflow.get("unit_id") or workflow.get("unit_id") == unit_id)
+        ]
+        workflow = candidates[0] if len(candidates) == 1 else None
+        if not workflow:
+            workflow = {
+                "id": str(uuid4()), "kind": "housing_move_in", "participant_id": participant["id"],
+                "property_id": property_id, "unit_id": unit_id, "record_types": [],
+                "document_ids": [], "fact_claims": [], "created_at": now(), "source": association_source,
+            }
+            self.data["move_in_workflows"].append(workflow)
+            self._event("move_in_workflow_opened", workflow["id"], {
+                "participant_id": participant["id"], "property_id": property_id, "unit_id": unit_id,
+                "document_id": document["id"], "source": association_source,
+            })
+        if property_id and not workflow.get("property_id"):
+            workflow["property_id"] = property_id
+        if unit_id and not workflow.get("unit_id"):
+            workflow["unit_id"] = unit_id
+        if document["id"] not in workflow["document_ids"]:
+            workflow["document_ids"].append(document["id"])
+        if extracted.document_type not in workflow["record_types"]:
+            workflow["record_types"].append(extracted.document_type)
+        workflow.setdefault("fact_claims", [])
+        for field, value in self._move_in_fact_values(extracted).items():
+            normalized_value = self._normalize_move_in_fact(field, value)
+            if not normalized_value:
+                continue
+            existing = next((claim for claim in workflow["fact_claims"] if claim["document_id"] == document["id"] and claim["field"] == field), None)
+            if existing:
+                continue
+            workflow["fact_claims"].append({
+                "field": field, "value": value, "normalized_value": normalized_value,
+                "document_id": document["id"], "record_type": extracted.document_type,
+                "provenance": association_source, "recorded_at": now(),
+            })
+        self._event("move_in_record_attached", workflow["id"], {
+            "participant_id": participant["id"], "property_id": workflow.get("property_id"),
+            "unit_id": workflow.get("unit_id"), "document_id": document["id"],
+            "record_type": extracted.document_type, "source": association_source,
+        })
+        return workflow
+
+    @staticmethod
+    def _move_in_fact_values(extracted: ExtractedDocument) -> dict[str, str]:
+        """Return only cross-document facts that should agree when both exist."""
+        return {
+            field: value for field, value in {
+                "property_address": extracted.property_address,
+                "unit": extracted.unit,
+                "monthly_rent": extracted.monthly_rent,
+                "security_deposit": extracted.security_deposit,
+                "move_in_date": extracted.move_in_date,
+                "lease_term": extracted.lease_term,
+            }.items() if value
+        }
+
+    @staticmethod
+    def _normalize_move_in_fact(field: str, value: str) -> str:
+        compact = re.sub(r"\s+", " ", value).strip().casefold()
+        if field in {"monthly_rent", "security_deposit"}:
+            amount = re.sub(r"[^0-9.]", "", compact)
+            try:
+                return format(Decimal(amount).normalize(), "f")
+            except (InvalidOperation, ValueError):
+                return amount
+        return compact
 
     def _link_addendum(self, document: dict, extracted: ExtractedDocument) -> dict:
         required = {"tenant", "property", "unit", "lease_date"}
@@ -1183,7 +1495,7 @@ class HomesteaderStore:
                         "document_id": document["id"], "participant_id": person["id"], "review_id": review_id,
                         "source": "human_review",
                     })
-                elif extracted.document_type == "housing_record":
+                elif extracted.document_type == "housing_record" or extracted.document_type in record_keys(self.move_in_definition):
                     record_result = self._file_housing_relationships(document, extracted, person, association_source="human_review")
                     self._event("housing_relationships_confirmed", record_result["housing_record_id"], {
                         "document_id": document["id"], "participant_id": person["id"], "review_id": review_id,

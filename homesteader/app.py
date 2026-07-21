@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+from datetime import datetime
 import json
 from pathlib import Path
 import socket
@@ -10,9 +12,12 @@ import subprocess
 import sys
 from uuid import uuid4
 
-from nicegui import app, ui
+from nicegui import app, background_tasks, ui
 
-from homesteader.core import HomesteaderStore
+from homesteader.audit import filter_correction_findings
+from homesteader.correction_export import export_correction_report
+from homesteader.core import HomesteaderStore, SUPPORTED_INTAKE_SUFFIXES
+from homesteader.inbox import inspect_inbox
 
 
 LOCAL_HOST = "127.0.0.1"
@@ -70,13 +75,16 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         packet_panel = ui.column().classes("panel w-full gap-3")
         review_panel = ui.column().classes("panel w-full gap-3")
         correction_panel = ui.column().classes("panel w-full gap-3")
+        queue_panel = ui.column().classes("panel w-full gap-3")
         detached_panel = ui.column().classes("panel w-full gap-3")
         relationship_panel = ui.column().classes("panel w-full gap-3")
         form_bank_panel = ui.column().classes("panel w-full gap-3")
         participant_panel = ui.column().classes("panel w-full gap-3")
 
         selected_packet_id: str | None = None
+        queue_worker_active = False
         participant_filters = {"query": "", "status": "all", "program": None, "has_lease": False, "date_from": None, "date_to": None}
+        correction_filters = {"query": "", "caseworker": None, "program": None, "category": None, "date_from": None, "date_to": None}
 
         def metrics_values() -> list[tuple[str, int]]:
             open_packets = store.open_intake_packets()
@@ -132,7 +140,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     upload = ui.upload(label="Add documents", multiple=True, auto_upload=True).props('accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff"')
                     upload.on_upload(receive_packet_upload)
                     with ui.row().classes("gap-2 flex-wrap"):
-                        ui.button("Process new scans", icon="folder_open", on_click=process_new_scans).props("outline no-caps")
+                        ui.button("Queue new scans", icon="playlist_add", on_click=process_new_scans).props("outline no-caps")
                         ui.button("Close packet", icon="task_alt", on_click=close_selected_packet).props("outline no-caps")
 
         def receive_packet_upload(event) -> None:
@@ -144,14 +152,13 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             destination = inbox_path / f"upload-{uuid4()}-{Path(event.name).name}"
             destination.write_bytes(event.content.read())
             try:
-                result = store.add_to_intake_packet(packet["id"], [destination])
+                jobs = store.queue_intake_sources(packet["id"], [destination])
                 store.save()
             except ValueError as error:
                 ui.notify(str(error), type="negative")
                 return
-            document_ids = [entry["result"].get("document_id") for entry in result["results"] if entry["result"].get("document_id")]
-            enriched = auto_queue_scan_proposals(document_ids)
-            ui.notify(f"Added {event.name} to the active packet" + (f"; locally reading {enriched} scanned form(s)." if enriched else "."), type="positive")
+            start_intake_worker()
+            ui.notify(f"Queued {event.name} for local processing." if jobs else f"{event.name} is already waiting to be processed.", type="positive")
             refresh_workspace()
 
         def close_selected_packet() -> None:
@@ -167,18 +174,56 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             packet = selected_packet()
             if not packet:
                 return
-            result = store.ingest_inbox(inbox_path, packet_id=packet["id"])
+            known_hashes = {document["sha256"] for document in store.data["documents"]}
+            sources = [
+                item.path for item in inspect_inbox(inbox_path)
+                if item.path.suffix.casefold() in SUPPORTED_INTAKE_SUFFIXES and item.sha256 not in known_hashes
+            ]
+            jobs = store.queue_intake_sources(packet["id"], sources)
             store.save()
-            document_ids = [entry["result"].get("document_id") for entry in result["processed"] if entry["result"].get("document_id")]
-            enriched = auto_queue_scan_proposals(document_ids)
-            if result["processed"]:
-                message = f"Added {len(result['processed'])} new scan{'s' if len(result['processed']) != 1 else ''}."
-                if enriched:
-                    message += f" Local vision proposals queued for {enriched}."
-                ui.notify(message, type="positive")
+            start_intake_worker()
+            if jobs:
+                ui.notify(f"Queued {len(jobs)} new scan{'s' if len(jobs) != 1 else ''} for local processing.", type="positive")
             else:
                 ui.notify("No new scans found.")
             refresh_workspace()
+
+        async def run_intake_worker() -> None:
+            nonlocal queue_worker_active
+            try:
+                while True:
+                    job = store.claim_next_intake_job()
+                    if not job:
+                        store.save()
+                        return
+                    store.save()
+                    try:
+                        result = await asyncio.to_thread(store.add_to_intake_packet, job["packet_id"], [Path(job["source_path"])])
+                        document_ids = [entry["result"].get("document_id") for entry in result["results"] if entry["result"].get("document_id")]
+                        enriched = await asyncio.to_thread(auto_queue_scan_proposals, document_ids)
+                        store.finish_intake_job(job["id"], result={"intake": result, "local_vision_proposals": enriched})
+                    except Exception as error:  # A bad scan must fail one job, not the whole backlog.
+                        store.finish_intake_job(job["id"], error=str(error))
+                    store.save()
+            finally:
+                queue_worker_active = False
+
+        def start_intake_worker() -> None:
+            nonlocal queue_worker_active
+            if queue_worker_active:
+                return
+            queue_worker_active = True
+            background_tasks.create(run_intake_worker(), name="homesteader-intake-queue")
+
+        def refresh_intake_queue() -> None:
+            queue_panel.clear()
+            with queue_panel:
+                counts = store.intake_job_counts()
+                ui.label("Local processing queue").classes("text-lg font-semibold")
+                ui.label(f"Waiting: {counts['waiting']} · Processing: {counts['processing']} · Completed: {counts['completed']} · Needs attention: {counts['failed']}").classes("text-sm muted")
+                failed = [job for job in store.data["intake_jobs"] if job.get("status") == "failed"][-3:]
+                for job in failed:
+                    ui.label(f"{job['source_name']}: {job.get('error', 'Could not process this scan.')}").classes("text-sm text-amber-800")
 
         def open_new_packet_dialog() -> None:
             with ui.dialog() as dialog, ui.card().classes("w-96"):
@@ -253,12 +298,18 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     with ui.column().classes("gap-0"):
                         ui.label("Correction findings").classes("text-lg font-semibold")
                         ui.label("Evidence-backed issues to resolve or include in the local correction report.").classes("text-sm muted")
-                    ui.label("Local audit").classes("text-sm muted")
-                findings = store.correction_findings()
+                    with ui.row().classes("gap-1"):
+                        ui.button(icon="filter_list", on_click=open_correction_filters).props("flat round").tooltip("Filter correction findings")
+                        ui.label("Local audit").classes("text-sm muted")
+                findings = filter_correction_findings(store.correction_findings(), **correction_filters)
                 if not findings:
-                    ui.label("No active correction findings.").classes("muted")
+                    ui.label("No correction findings match the current filters." if any(correction_filters.values()) else "No active correction findings.").classes("muted")
                     return
-                ui.label(f"{len(findings)} finding{'s' if len(findings) != 1 else ''} · exportable through the local correction-report command").classes("text-sm muted")
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label(f"{len(findings)} finding{'s' if len(findings) != 1 else ''} shown").classes("text-sm muted")
+                    with ui.row().classes("gap-2"):
+                        ui.button("View report", icon="summarize", on_click=lambda findings=findings: open_correction_report(findings)).props("outline no-caps")
+                        ui.button("Export XLSX", icon="download", on_click=lambda findings=findings: download_correction_report(findings)).props("outline no-caps")
                 for finding in findings[:8]:
                     with ui.card().classes("w-full border border-slate-200 shadow-none"):
                         with ui.row().classes("w-full items-start justify-between"):
@@ -266,28 +317,108 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 ui.label(f"{finding['ptc']} · {finding['category']}").classes("font-medium text-sm")
                                 if finding["document"]:
                                     ui.label(finding["document"]).classes("text-sm muted")
+                                if finding.get("program") or finding.get("finding_date"):
+                                    ui.label(" · ".join(part for part in [finding.get("program"), finding.get("finding_date")] if part)).classes("text-xs muted")
                                 ui.label(finding["error"]).classes("text-sm")
                                 ui.label(f"Recommended: {finding['recommendation']}").classes("text-sm text-teal-800")
                             if finding["document_id"]:
                                 ui.button(icon="visibility", on_click=lambda document_id=finding["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
 
+        def open_correction_filters() -> None:
+            all_findings = store.correction_findings()
+            caseworkers = sorted({item["caseworker"] for item in all_findings if item.get("caseworker")})
+            programs = sorted({item["program"] for item in all_findings if item.get("program")})
+            categories = sorted({item["category"] for item in all_findings if item.get("category")})
+            with ui.dialog() as dialog, ui.card().classes("w-96"):
+                ui.label("Filter correction findings").classes("text-lg font-semibold")
+                ui.label("Filters only change this local report view and its export.").classes("text-sm muted")
+                query = ui.input("PTC, HMIS ID, document, or issue", value=correction_filters["query"]).classes("w-full")
+                caseworker = ui.select(["All caseworkers", *caseworkers], value=correction_filters["caseworker"] or "All caseworkers", label="Caseworker").classes("w-full")
+                program = ui.select(["All programs", *programs], value=correction_filters["program"] or "All programs", label="Program").classes("w-full")
+                category = ui.select(["All error types", *categories], value=correction_filters["category"] or "All error types", label="Error type").classes("w-full")
+                date_from = ui.input("Finding date from (YYYY-MM-DD)", value=correction_filters["date_from"] or "").classes("w-full")
+                date_to = ui.input("Finding date to (YYYY-MM-DD)", value=correction_filters["date_to"] or "").classes("w-full")
+
+                def clear() -> None:
+                    correction_filters.update({"query": "", "caseworker": None, "program": None, "category": None, "date_from": None, "date_to": None})
+                    dialog.close()
+                    refresh_correction_findings()
+
+                def apply() -> None:
+                    correction_filters.update({
+                        "query": query.value or "", "caseworker": None if caseworker.value == "All caseworkers" else caseworker.value,
+                        "program": None if program.value == "All programs" else program.value,
+                        "category": None if category.value == "All error types" else category.value,
+                        "date_from": date_from.value or None, "date_to": date_to.value or None,
+                    })
+                    dialog.close()
+                    refresh_correction_findings()
+
+                with ui.row().classes("w-full justify-between"):
+                    ui.button("Clear", on_click=clear).props("flat no-caps")
+                    ui.button("Apply filters", on_click=apply).props("no-caps")
+            dialog.open()
+
+        def open_correction_report(findings: list[dict]) -> None:
+            with ui.dialog() as dialog, ui.card().classes("w-[66rem] max-w-full"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    with ui.column().classes("gap-0"):
+                        ui.label("Correction report").classes("text-xl font-semibold")
+                        ui.label(f"{len(findings)} filtered local finding{'s' if len(findings) != 1 else ''}").classes("text-sm muted")
+                    ui.button(icon="close", on_click=dialog.close).props("flat round")
+                for finding in findings:
+                    with ui.card().classes("w-full border border-slate-200 shadow-none"):
+                        ui.label(f"{finding['ptc']} · {finding['category']}").classes("font-medium")
+                        details = [finding.get("participant_identifier"), finding.get("caseworker"), finding.get("program"), finding.get("finding_date")]
+                        ui.label(" · ".join(detail for detail in details if detail)).classes("text-sm muted")
+                        if finding.get("document"):
+                            ui.label(f"Document: {finding['document']}").classes("text-sm muted")
+                        ui.label(f"Reported error: {finding['error']}").classes("text-sm")
+                        ui.label(f"Recommended correction: {finding['recommendation']}").classes("text-sm text-teal-800")
+                        ui.label(f"Evidence source: {finding['source']}").classes("text-xs muted")
+                        if finding.get("document_id"):
+                            ui.button("View source", icon="visibility", on_click=lambda document_id=finding["document_id"]: open_document_viewer(document_id)).props("flat no-caps")
+            dialog.open()
+
+        def download_correction_report(findings: list[dict]) -> None:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+            output_path = store.path.parent / "reports" / f"Homesteader_Correction_Report_{timestamp}.xlsx"
+            try:
+                export_correction_report(findings, output_path)
+            except RuntimeError as error:
+                ui.notify(str(error), type="negative")
+                return
+            ui.download(output_path, filename=output_path.name)
+            ui.notify(f"Local correction report created with {len(findings)} finding{'s' if len(findings) != 1 else ''}.", type="positive")
+
         def refresh_relationship_search() -> None:
             relationship_panel.clear()
             with relationship_panel:
                 ui.label("Relationship search").classes("text-lg font-semibold")
-                ui.label("Search a landlord, property, unit, or other recorded entity to find connected participant files.").classes("text-sm muted")
+                ui.label("Search canonical names and confirmed aliases to find connected participant files. Similar names are never silently merged.").classes("text-sm muted")
                 query = ui.input("Landlord or property name").classes("w-full")
                 results = ui.column().classes("w-full gap-2")
 
                 def run_search() -> None:
                     results.clear()
                     matches = store.relationship_search(query.value or "")
+                    entities = store.entity_directory_search(query.value or "")
                     with results:
                         if not (query.value or "").strip():
                             ui.label("Enter a landlord or property name.").classes("text-sm muted")
-                        elif not matches:
+                        elif not entities:
                             ui.label("No participant files are linked to that recorded entity yet.").classes("text-sm muted")
                         else:
+                            ui.label("Canonical entities and confirmed aliases").classes("text-sm font-medium")
+                            for entity in entities:
+                                with ui.row().classes("w-full items-center justify-between"):
+                                    with ui.column().classes("gap-0"):
+                                        ui.label(f"{entity['name']} ({entity['kind'].replace('_', ' ')})").classes("text-sm")
+                                        if entity["aliases"]:
+                                            ui.label("Aliases: " + ", ".join(entity["aliases"])).classes("text-xs muted")
+                                    ui.button("Add alias", icon="alternate_email", on_click=lambda entity=entity: open_alias_dialog(entity)).props("flat no-caps")
+                            if matches:
+                                ui.label("Connected participant files").classes("text-sm font-medium mt-2")
                             for match in matches:
                                 identifier = match["hmis_id"] or match["temporary_id"] or "No identifier yet"
                                 with ui.row().classes("w-full items-center justify-between"):
@@ -295,6 +426,29 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                     ui.button("Open file", icon="folder_open", on_click=lambda person_id=match["person_id"]: open_participant_file(person_id)).props("flat no-caps")
 
                 ui.button("Search relationships", icon="account_tree", on_click=run_search).props("outline no-caps")
+
+        def open_alias_dialog(entity: dict) -> None:
+            with ui.dialog() as dialog, ui.card().classes("w-96"):
+                ui.label(f"Add alias for {entity['name']}").classes("text-lg font-semibold")
+                ui.label("This creates another reliable search name for this one entity. It does not merge similarly named landlords, properties, or people.").classes("text-sm muted")
+                alias = ui.input("Confirmed alternate name").classes("w-full")
+                note = ui.input("Optional confirmation note").classes("w-full")
+
+                def save_alias() -> None:
+                    try:
+                        store.add_entity_alias(entity["entity_id"], alias.value or "", note=note.value or None)
+                        store.save()
+                    except ValueError as error:
+                        ui.notify(str(error), type="negative")
+                        return
+                    dialog.close()
+                    ui.notify("Confirmed alias saved.", type="positive")
+                    refresh_workspace()
+
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                    ui.button("Save alias", on_click=save_alias).props("no-caps")
+            dialog.open()
 
         def refresh_form_bank() -> None:
             form_bank_panel.clear()
@@ -574,6 +728,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             attributes = summary["attributes"]
             identifier = attributes.get("hmis_id") or attributes.get("temporary_id") or "No identifier yet"
             schedule_items = [item for item in store.housing_schedule_status() if item["person_id"] == person_id]
+            move_in_items = [item for item in store.move_in_workflow_status() if item["participant_id"] == person_id]
             with ui.dialog() as dialog, ui.card().classes("w-[60rem] max-w-full"):
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.column().classes("gap-0"):
@@ -605,6 +760,18 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                             "text-sm text-teal-800" if item["status"] == "documented" else "text-sm text-amber-800"
                         )
                     ui.label(f"Standard end date: {schedule_items[0]['standard_end_date']} (exceptions must be recorded separately)").classes("text-xs muted")
+                if move_in_items:
+                    ui.label("Move-in workflows").classes("font-medium mt-3")
+                    for item in move_in_items:
+                        present = ", ".join(value.replace("_", " ") for value in item["present_record_types"])
+                        missing = ", ".join(value.replace("_", " ") for value in item["missing_record_types"])
+                        state_class = "text-amber-800" if item["status"] == "needs_review" else "text-teal-800"
+                        ui.label(f"{item['status'].replace('_', ' ').title()} · present: {present or 'none'}").classes(f"text-sm {state_class}")
+                        if missing:
+                            ui.label(f"Still expected for local review: {missing}").classes("text-sm text-amber-800")
+                        for conflict in item.get("conflicts", []):
+                            values = " / ".join(conflict["values"])
+                            ui.label(f"Review conflict: {conflict['field'].replace('_', ' ')} — {values}").classes("text-sm text-amber-800")
                 ui.label("Ledger history").classes("font-medium mt-3")
                 if not summary["events"]:
                     ui.label("No events recorded yet.").classes("text-sm muted")
@@ -618,12 +785,16 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             refresh_detached()
             refresh_reviews()
             refresh_correction_findings()
+            refresh_intake_queue()
             refresh_relationship_search()
             refresh_form_bank()
             refresh_participant_index()
 
         refresh_button.on_click(refresh_workspace)
+        ui.timer(1.5, refresh_intake_queue)
         refresh_workspace()
+        if store.intake_job_counts()["waiting"]:
+            start_intake_worker()
 
 
 def main() -> None:

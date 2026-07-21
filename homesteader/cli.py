@@ -37,6 +37,8 @@ def main() -> None:
     resolve.add_argument("--note")
     subcommands.add_parser("correction-findings", help="Print local correction-report rows as JSON")
     subcommands.add_parser("housing-schedule", help="Print derived Housing Services schedule status as JSON")
+    subcommands.add_parser("init-program-rules", help="Create the editable local program-rules template if it does not exist")
+    subcommands.add_parser("init-move-in-rules", help="Create the editable local move-in workflow template if it does not exist")
     import_proposal = subcommands.add_parser("import-ai-proposal", help="Validate and queue a local AI proposal JSON file")
     import_proposal.add_argument("proposal", type=Path)
     subcommands.add_parser("status", help="Show stored counts")
@@ -72,6 +74,10 @@ def main() -> None:
         print(json.dumps(store.correction_findings(), indent=2))
     elif args.command == "housing-schedule":
         print(json.dumps(store.housing_schedule_status(), indent=2))
+    elif args.command == "init-program-rules":
+        print(store.initialize_program_rules())
+    elif args.command == "init-move-in-rules":
+        print(store.initialize_move_in_rules())
     elif args.command == "import-ai-proposal":
         print(json.dumps(store.submit_ai_proposal(json.loads(args.proposal.read_text())), indent=2))
     else:

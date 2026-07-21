@@ -1,0 +1,15 @@
+MOVE-IN ASSISTANCE REQUEST FORM
+
+Participant: Jasmine Morales
+HMIS ID: H-MOVE-000042
+Property manager: Avery Collins
+Property address: 1415 Harbor View Avenue
+Unit: 2A
+Monthly rent: $1,850.00
+Security deposit: $925.00
+Move-in date: 2026-08-01
+Lease term: 12-month
+Payee name: Harbor View Management LLC
+Document date: 2026-07-20
+
+Fictional completed fixture for move-in workflow testing.

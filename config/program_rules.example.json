@@ -1,0 +1,20 @@
+{
+  "programs": [
+    {
+      "key": "tls",
+      "display_name": "Transitional Living Services",
+      "match_terms": ["tls", "transitional living services"],
+      "duration_months": 24,
+      "scheduled_requirements": [
+        {
+          "key": "income_verification",
+          "label": "income eligibility / verification",
+          "event_types": ["income_declaration_recorded", "income_verification_recorded"],
+          "every_months": 3,
+          "starts_at_month": 0,
+          "grace_days": 0
+        }
+      ]
+    }
+  ]
+}

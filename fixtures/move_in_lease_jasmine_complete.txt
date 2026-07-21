@@ -1,0 +1,12 @@
+RESIDENTIAL LEASE AGREEMENT
+
+Participant: Jasmine Morales
+Landlord: Harbor View Management LLC
+Premises: 1415 Harbor View Avenue, Unit 2A
+Lease signed: July 20, 2026
+Monthly rent: $1,850
+Security deposit: $925
+Move-in date: 2026-08-01
+Lease term: 12-month
+
+Fictional completed lease fixture for move-in workflow testing.

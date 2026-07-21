@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 RECOMMENDATIONS = {
     "identity_conflict": "Compare the source documents and HMIS record, then confirm the correct participant file before filing this document.",
     "missing_identity": "Locate or obtain the participant HMIS number, then confirm the correct participant file before filing.",
@@ -15,6 +14,7 @@ RECOMMENDATIONS = {
     "source_archive_missing": "Restore the original source file from the approved intake location or backup before relying on extracted metadata.",
     "scheduled_record_missing": "Verify whether this scheduled record was completed and upload or document the appropriate record. If an approved exception applies, record that exception in the participant ledger.",
     "revision_confirmation": "Compare both source documents. Confirm the newer copy only if it is the same document instance and its additional fields are supported by the source.",
+    "move_in_fact_conflict": "Compare the cited original records, determine the correct value through the appropriate casework process, and preserve the conflicting source records rather than overwriting either one.",
 }
 
 
@@ -35,8 +35,12 @@ def correction_findings(store) -> list[dict]:
         attributes = person.get("attributes", {})
         return person["name"], attributes.get("hmis_id") or attributes.get("temporary_id") or "", attributes.get("caseworker") or "Not recorded"
 
-    def append(*, category: str, person_id: str | None, document: dict | None, error: str, source: str) -> None:
+    def append(
+        *, category: str, person_id: str | None, document: dict | None,
+        error: str, source: str, program: str = "", finding_date: str = "",
+    ) -> None:
         ptc, identifier, caseworker = participant_details(person_id)
+        extracted = (document or {}).get("extracted", {})
         findings.append({
             "caseworker": caseworker,
             "ptc": ptc,
@@ -47,6 +51,8 @@ def correction_findings(store) -> list[dict]:
             "error": error,
             "recommendation": RECOMMENDATIONS[category],
             "source": source,
+            "program": program or extracted.get("program") or "",
+            "finding_date": finding_date or extracted.get("document_date") or "",
         })
 
     for person in people.values():
@@ -84,6 +90,51 @@ def correction_findings(store) -> list[dict]:
             error=(f"No {status['requirement']} was recorded for the period beginning "
                    f"{status['due_date']} in {status['program']} (enrolled {status['enrollment_date']})."),
             source="Housing Services standard schedule",
+            program=status["program"], finding_date=status["due_date"],
         )
 
+    for workflow in store.move_in_workflow_status():
+        for conflict in workflow.get("conflicts", []):
+            append(
+                category="move_in_fact_conflict", person_id=workflow["participant_id"], document=None,
+                error=(f"Move-in workflow has conflicting {conflict['field'].replace('_', ' ')} values: "
+                       f"{'; '.join(conflict['values'])}."),
+                source="Housing Services move-in workflow consistency check",
+            )
+
     return sorted(findings, key=lambda row: (row["caseworker"], row["ptc"], row["category"], row["document"]))
+
+
+def filter_correction_findings(
+    findings: list[dict], *, query: str = "", caseworker: str | None = None,
+    program: str | None = None, category: str | None = None,
+    date_from: str | None = None, date_to: str | None = None,
+) -> list[dict]:
+    """Narrow correction findings without changing any local record.
+
+    Dates are source document dates where available, or the due date for a
+    missing scheduled record. Blank dates stay visible unless the user chooses
+    a date filter; that prevents undated source records from being mistaken for
+    nonexistent ones.
+    """
+    needle = query.strip().casefold()
+    filtered = []
+    for finding in findings:
+        if needle and needle not in " ".join([
+            finding.get("ptc", ""), finding.get("participant_identifier", ""),
+            finding.get("document", ""), finding.get("error", ""),
+        ]).casefold():
+            continue
+        if caseworker and finding.get("caseworker") != caseworker:
+            continue
+        if program and finding.get("program") != program:
+            continue
+        if category and finding.get("category") != category:
+            continue
+        finding_date = finding.get("finding_date") or ""
+        if date_from and (not finding_date or finding_date < date_from):
+            continue
+        if date_to and (not finding_date or finding_date > date_to):
+            continue
+        filtered.append(finding)
+    return filtered

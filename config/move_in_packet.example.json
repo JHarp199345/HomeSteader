@@ -1,0 +1,122 @@
+{
+  "workflow_key": "housing_move_in",
+  "display_name": "Housing move-in packet",
+  "status": "source_derived_draft",
+  "description": "Local, editable definition derived from the supplied blank landlord packet. It organizes and checks records; it does not decide eligibility or submit anything externally.",
+  "entities": [
+    "participant",
+    "property",
+    "unit",
+    "legal_owner",
+    "payee",
+    "property_manager",
+    "authorized_representative",
+    "lease"
+  ],
+  "records": [
+    {
+      "key": "move_in_assistance_request",
+      "label": "Move-In Assistance Request Form",
+      "detection_terms": ["MOVE-IN ASSISTANCE REQUEST FORM", "FORM 1648"],
+      "role": "opens_or_supports_move_in_workflow",
+      "expected": "core"
+    },
+    {
+      "key": "landlord_rental_assistance_acknowledgement",
+      "label": "Landlord Rental Assistance Acknowledgement",
+      "detection_terms": ["LANDLORD RENTAL ASSISTANCE ACKNOWLEDGEMENT"],
+      "role": "landlord_direct_payment_agreement",
+      "expected": "core"
+    },
+    {
+      "key": "unit_information_owner_certification",
+      "label": "Unit Information and Owner Certifications",
+      "detection_terms": ["UNIT INFORMATION AND OWNER CERTIFICATIONS"],
+      "role": "unit_owner_and_rent_certification",
+      "expected": "core"
+    },
+    {
+      "key": "w9",
+      "label": "Form W-9",
+      "detection_terms": ["REQUEST FOR TAXPAYER IDENTIFICATION NUMBER AND CERTIFICATION", "FORM W-9"],
+      "role": "payee_tax_identity",
+      "expected": "core",
+      "notes": "The W-9 tax identity can belong to the payee or authorized business entity and is not assumed to be identical to the legal owner."
+    },
+    {
+      "key": "lease",
+      "label": "Signed lease or rental agreement",
+      "detection_terms": ["LEASE", "RENTAL AGREEMENT"],
+      "role": "tenancy_evidence",
+      "expected": "core"
+    },
+    {
+      "key": "ownership_verification",
+      "label": "Property ownership verification",
+      "detection_terms": ["ASSESSOR", "OWNERSHIP VERIFICATION"],
+      "role": "external_owner_evidence",
+      "expected": "core",
+      "notes": "Usually received from the assessor's office; this packet definition does not assume a particular format."
+    },
+    {
+      "key": "habitability_standards",
+      "label": "Habitability Standards for Permanent Housing",
+      "detection_terms": ["HABITABILITY STANDARDS FOR PERMANENT HOUSING", "FORM 1083"],
+      "role": "property_approval_evidence",
+      "expected": "core"
+    },
+    {
+      "key": "letter_of_authorization",
+      "label": "Letter of Authorization",
+      "detection_terms": ["LETTER OF AUTHORIZATION", "AUTHORIZED TO SIGN LAFH DOCUMENTATION"],
+      "role": "authorized_signer_evidence",
+      "expected": "conditional",
+      "condition": "Required when the legal owner or certified agent delegates signing of the landlord acknowledgement, owner certification, or W-9."
+    },
+    {
+      "key": "landlord_incentive_fee_agreement",
+      "label": "Landlord Incentive Fee Agreement Form",
+      "detection_terms": ["LANDLORD INCENTIVE FEE AGREEMENT FORM", "FORM 1093"],
+      "role": "incentive_payment_evidence",
+      "expected": "conditional",
+      "condition": "Required only when a landlord incentive payment is being requested or issued."
+    }
+  ],
+  "shared_fact_checks": [
+    {
+      "field": "participant_identity",
+      "applies_to": ["move_in_assistance_request", "lease", "landlord_rental_assistance_acknowledgement", "unit_information_owner_certification", "landlord_incentive_fee_agreement"],
+      "rule": "HMIS identifier is the preferred match. A name alone only proposes a relationship and may require review."
+    },
+    {
+      "field": "property_and_unit",
+      "applies_to": ["move_in_assistance_request", "lease", "landlord_rental_assistance_acknowledgement", "unit_information_owner_certification", "ownership_verification", "habitability_standards", "letter_of_authorization", "landlord_incentive_fee_agreement"],
+      "rule": "Street address and unit should agree when the field exists. A missing unit is incomplete evidence, not proof of conflict."
+    },
+    {
+      "field": "monthly_rent",
+      "applies_to": ["move_in_assistance_request", "lease", "landlord_rental_assistance_acknowledgement", "unit_information_owner_certification", "landlord_incentive_fee_agreement"],
+      "rule": "Compare stated monthly rent values. Different values create a review finding; Homesteader does not choose one as correct."
+    },
+    {
+      "field": "security_deposit",
+      "applies_to": ["move_in_assistance_request", "lease", "unit_information_owner_certification", "landlord_incentive_fee_agreement"],
+      "rule": "Compare only where both documents state a deposit."
+    },
+    {
+      "field": "move_in_date_and_lease_term",
+      "applies_to": ["move_in_assistance_request", "lease", "unit_information_owner_certification", "landlord_incentive_fee_agreement"],
+      "rule": "Compare move-in/start date and term where stated. Signature dates are chronology evidence and are not required to be identical."
+    },
+    {
+      "field": "owner_payee_and_signer",
+      "applies_to": ["w9", "ownership_verification", "landlord_rental_assistance_acknowledgement", "unit_information_owner_certification", "letter_of_authorization", "lease", "landlord_incentive_fee_agreement"],
+      "rule": "Represent legal owner, payee, manager, and authorized signer as separate entities with explicit links. Do not require their names to match."
+    }
+  ],
+  "readiness": {
+    "default_prompt_mode": "off",
+    "states": ["in_progress", "needs_review", "complete_for_local_review"],
+    "notes": "Destination-specific states such as ready_for_hmis or ready_for_accounting require the agency's confirmed checklist and are intentionally not enabled by this example."
+  }
+}

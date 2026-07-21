@@ -49,7 +49,31 @@ For a packet scanned over time from the command line:
 .venv/bin/python -m homesteader.cli --state data/demo.json close-packet PACKET_ID
 ```
 
-To use the folder intake action, place supported files in `inbox/`, choose the intended active packet in the local workspace, then select **Process new scans**. Files remain in place; a raw-file hash prevents a later pass from processing the same file again.
+To use the folder intake action, place supported files in `inbox/`, choose the intended active packet in the local workspace, then select **Queue new scans**. Files remain in place; a raw-file hash prevents a later pass from processing the same file again.
+
+The workspace queues new scans locally and processes them one at a time in the background. This keeps the intake screen usable while a large PDF, OCR pass, or local vision proposal is running. The compact queue panel shows waiting, processing, completed, and needs-attention counts; interrupted jobs return to waiting when the workspace restarts.
+
+### Program rules and packet activation
+
+TLS schedule rules are local, inspectable configuration rather than hidden logic. The included example is [program_rules.example.json](config/program_rules.example.json). To create a user-editable local copy beside the Homesteader state file, run:
+
+```bash
+.venv/bin/python -m homesteader.cli --state data/homesteader.json init-program-rules
+```
+
+Fresh intake packets may be uploaded in pieces. A schedule baseline from a document inside an **open** intake packet is not audited until the packet is closed; after closure, the relevant initial and later quarterly requirements can be tracked normally.
+
+### Move-in workflows
+
+Homesteader recognizes the source-derived Housing Services move-in packet: move-in assistance request, landlord acknowledgement, unit/owner certification, W-9, lease, ownership verification, habitability record, and applicable authorization or incentive records. Any recognized member with a safely associated participant can open or join the same local move-in workflow, regardless of scan order. The participant file shows the records present and the remaining core evidence expected for local review.
+
+The included definition is [move_in_packet.example.json](config/move_in_packet.example.json). To create a user-editable local copy beside the state file, run:
+
+```bash
+.venv/bin/python -m homesteader.cli --state data/homesteader.json init-move-in-rules
+```
+
+This first version reports `in progress`, `needs review`, or `complete for local review`. It compares shared address/unit, rent, deposit, move-in-date, and lease-term values when multiple records state them; values are never silently overwritten. It does not decide eligibility, authorize payment, or claim a package is ready for HMIS or Accounting.
 
 ### iCloud Drive scan folder
 
@@ -135,7 +159,7 @@ Optional AI integration now has a local, model-neutral proposal contract: an AI 
 
 Homesteader can audit its own local record state and produce evidence-backed correction findings for the same kinds of work that a manual data-quality review catches: unresolved identity conflicts, missing HMIS confirmation, duplicate checks, OCR confirmation, missing time context, classification decisions, and missing local source archives. Each finding names the PTC when determinable, the affected document, the observed error, a clear recommended correction, and the source of the finding. It does not invent compliance violations or modify records during the audit.
 
-The spreadsheet exporter creates a correction-report workbook with a readable working sheet and an `Audit Data` sheet ready for Excel or Google Sheets import. It uses only the local audit findings; it does not contact HMIS, CHAMP, or another external system.
+The local workspace now includes a **Correction findings** panel with filters for PTC/HMIS ID, caseworker, program, error type, and finding date. **View report** shows the complete evidence-backed findings; **Export XLSX** exports exactly the currently filtered rows to a readable workbook with an `Audit Data` sheet, ready for Excel or Google Sheets. It uses only local audit findings and does not contact HMIS, CHAMP, or another external system.
 
 For the current local prototype, generate the findings JSON and then the workbook:
 
@@ -144,7 +168,7 @@ For the current local prototype, generate the findings JSON and then the workboo
 node tools/export_correction_report.mjs /tmp/homesteader-findings.json correction-report.xlsx
 ```
 
-An in-app export button is the next convenience layer; the audit rules and workbook output are already local and testable.
+The command-line export remains available for automation or troubleshooting.
 
 ## Housing Services schedules
 
@@ -153,6 +177,15 @@ Housing Services is now the first active domain module. A recorded TLS enrollmen
 For an existing caseload brought into Homesteader mid-program, a quarterly checkpoint can establish the participant/program network and carry a stated enrollment date without triggering a retroactive missing-document list. Its ingestion creates a **historical baseline**; only scheduled obligations after that baseline are audited. This lets the system begin with the paperwork actually available today rather than demanding a complete historical import.
 
 A recognized program-exit document with an exact HMIS identity, exit date, and one unambiguous program case closes future schedule expectations while retaining the complete digital record. It does not delete or hide the participant file. If a purported exit record lacks an exit date or cannot identify one program case, it goes to review rather than closing anything.
+
+## Canonical entities and reverse lookup
+
+Homesteader keeps properties, legal landlords, managers, units, and people as
+separate canonical entities. It can record a human-confirmed alternate name
+such as `Harbor View Apts.` for `Harbor View Apartments`, making either name a
+reliable reverse-search entry point. It does not fuzzy-merge `Harbor View
+Apartments` with `Harbor View LLC`; if they are related, that is recorded as an
+explicit relationship such as `landlord_for`.
 
 This is deliberately a configurable policy layer, not an attempt to guess every program rule. Additional TLS, ABH, shelter, and tiny-home requirements should be added only after their actual checklist, cadence, and exception policy are confirmed. Extensions, transfers, pauses, and exits must be explicit ledger events; Homesteader never assumes them.
 

@@ -9,6 +9,50 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LeaseLinkingTests(unittest.TestCase):
+
+    def test_intake_jobs_are_persistent_and_claimed_one_at_a_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            store = HomesteaderStore(folder / "state.json")
+            packet = store.start_intake_packet("Queue test")
+            source = folder / "scan.txt"
+            source.write_text("Example scan")
+            jobs = store.queue_intake_sources(packet["id"], [source])
+            self.assertEqual(store.intake_job_counts()["waiting"], 1)
+            self.assertEqual(store.queue_intake_sources(packet["id"], [source]), [])
+            job = store.claim_next_intake_job()
+            self.assertEqual(job["status"], "processing")
+            self.assertIsNone(store.claim_next_intake_job())
+            store.finish_intake_job(job["id"], result={"status": "filed"})
+            self.assertEqual(store.intake_job_counts()["completed"], 1)
+
+    def test_interrupted_processing_job_returns_to_waiting_on_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / "state.json"
+            store = HomesteaderStore(path)
+            packet = store.start_intake_packet("Queue test")
+            source = folder / "scan.txt"
+            source.write_text("Example scan")
+            store.queue_intake_sources(packet["id"], [source])
+            store.claim_next_intake_job()
+            store.save()
+            restarted = HomesteaderStore(path)
+            self.assertEqual(restarted.intake_job_counts()["waiting"], 1)
+
+    def test_confirmed_entity_alias_supports_reverse_search_without_merging_owner_and_property(self):
+        participant = self.store._new_entity("person", "Jasmine Morales", hmis_id="H-000042")
+        property_entity = self.store._entity("property", "Harbor View Apartments")
+        owner = self.store._entity("landlord", "Harbor View LLC")
+        self.store._relationship("program_documented_for", participant["id"], property_entity["id"], "test")
+        self.store._relationship("landlord_for", owner["id"], property_entity["id"], "test")
+        self.store.add_entity_alias(property_entity["id"], "Harbor View Apts.")
+
+        directory = self.store.entity_directory_search("Harbor View Apts")
+        reverse = self.store.relationship_search("Harbor View Apts")
+        self.assertEqual(directory[0]["entity_id"], property_entity["id"])
+        self.assertEqual(reverse[0]["person_id"], participant["id"])
+        self.assertNotEqual(property_entity["id"], owner["id"])
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = HomesteaderStore(Path(self.temp.name) / "state.json")
@@ -24,7 +68,8 @@ class LeaseLinkingTests(unittest.TestCase):
         relationship = next(item for item in self.store.data["relationships"] if item["type"] == "modifies")
         self.assertEqual(relationship["type"], "modifies")
         self.assertEqual(relationship["confidence"], 1.0)
-        self.assertEqual(len(self.store.data["ledger_events"]), 2)
+        self.assertTrue(any(event["type"] == "lease_created" for event in self.store.data["ledger_events"]))
+        self.assertTrue(any(event["type"] == "move_in_workflow_opened" for event in self.store.data["ledger_events"]))
 
     def test_lease_connects_existing_participant_landlord_and_property_for_reverse_search(self):
         participant = self.store.ingest(ROOT / "fixtures/tls_participant_identification_jasmine_a.txt")
@@ -58,6 +103,63 @@ class LeaseLinkingTests(unittest.TestCase):
         self.assertEqual(result["participant_id"], participant["person_id"])
         self.assertEqual([match["name"] for match in self.store.relationship_search("Avery Collins")], ["Jasmine Morales"])
         self.assertEqual([match["name"] for match in self.store.relationship_search("Harbor View")], ["Jasmine Morales"])
+
+    def test_move_in_records_open_one_workflow_and_track_missing_core_evidence(self):
+        request = self.store.ingest(ROOT / "fixtures/tls_move_in_assistance_jasmine_harbor_view.txt")
+        lease = self.store.ingest(ROOT / "fixtures/tls_lease_jasmine_harbor_view.txt")
+
+        self.assertEqual(request["status"], "filed")
+        self.assertEqual(lease["status"], "filed")
+        self.assertEqual(request["move_in_workflow_id"], lease["move_in_workflow_id"])
+        workflow = self.store.move_in_workflow_status(request["move_in_workflow_id"])[0]
+        self.assertEqual(workflow["status"], "in_progress")
+        self.assertIn("move_in_assistance_request", workflow["present_record_types"])
+        self.assertIn("lease", workflow["present_record_types"])
+        self.assertIn("w9", workflow["missing_record_types"])
+        self.assertIn("ownership_verification", workflow["missing_record_types"])
+
+    def test_move_in_rules_are_copied_locally_without_overwriting_a_local_policy(self):
+        path = self.store.initialize_move_in_rules()
+        self.assertTrue(path.exists())
+        original = path.read_text()
+        path.write_text('{"workflow_key":"custom"}')
+        self.store.initialize_move_in_rules()
+        self.assertEqual(path.read_text(), '{"workflow_key":"custom"}')
+
+    def test_completed_fictional_move_in_packet_reaches_local_review_after_contextual_attachment(self):
+        request = self.store.ingest(ROOT / "fixtures/move_in_request_jasmine_complete.txt")
+        for name in [
+            "move_in_lease_jasmine_complete.txt",
+            "move_in_landlord_acknowledgement_jasmine_complete.txt",
+            "move_in_unit_owner_certification_jasmine_complete.txt",
+        ]:
+            self.assertEqual(self.store.ingest(ROOT / "fixtures" / name)["status"], "filed")
+
+        person_id = request["participant_id"]
+        for name in [
+            "move_in_w9_harbor_view_complete.txt",
+            "move_in_ownership_verification_harbor_view_complete.txt",
+            "move_in_habitability_harbor_view_complete.txt",
+        ]:
+            result = self.store.ingest(ROOT / "fixtures" / name)
+            self.assertEqual(result["status"], "needs_review")
+            self.store.resolve_review(result["review_id"], "assign_existing", entity_id=person_id, note="Verified against the active fictional move-in packet.")
+
+        workflow = self.store.move_in_workflow_status()[0]
+        self.assertEqual(workflow["status"], "complete_for_local_review")
+        self.assertEqual(workflow["missing_record_types"], [])
+        self.assertEqual(workflow["conflicts"], [])
+
+    def test_conflicting_move_in_rent_stays_visible_for_review(self):
+        self.store.ingest(ROOT / "fixtures/move_in_request_jasmine_complete.txt")
+        conflict = Path(self.temp.name) / "conflicting-lease.txt"
+        conflict.write_text((ROOT / "fixtures/move_in_lease_jasmine_complete.txt").read_text().replace("$1,850", "$1,900"))
+        self.store.ingest(conflict)
+
+        workflow = self.store.move_in_workflow_status()[0]
+        self.assertEqual(workflow["status"], "needs_review")
+        self.assertEqual(workflow["conflicts"][0]["field"], "monthly_rent")
+        self.assertTrue(any(row["category"] == "Move In Fact Conflict" for row in self.store.correction_findings()))
 
     def test_ambiguous_addendum_goes_to_review(self):
         self.store.ingest(ROOT / "fixtures/lease_elena_ramirez.txt")
