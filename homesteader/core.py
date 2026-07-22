@@ -130,6 +130,20 @@ def find_value(label: str, text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def find_hmis_identifier(text: str) -> str | None:
+    """Recover a clearly formatted HMIS-style identifier from extracted text.
+
+    Some completed PDFs put field labels in one visual area and their values in
+    another.  In that case a line-oriented label extractor cannot see that the
+    value belongs to ``HMIS #`` even though the identifier itself survived text
+    extraction.  This deliberately recognizes only the hyphenated, explicit
+    identifier shape used by the local record; ordinary names and dates never
+    qualify.
+    """
+    match = re.search(r"\bH(?:MIS)?-(?:[A-Z0-9]+-)*[A-Z0-9]+\b", text, re.IGNORECASE)
+    return match.group(0).upper() if match else None
+
+
 def extract_document(text: str) -> ExtractedDocument:
     upper = text.upper()
     facts = extract_common_facts(text)
@@ -221,7 +235,7 @@ def extract_document(text: str) -> ExtractedDocument:
         primary_care_provider=value("primary_care_provider"),
         mental_health_provider=value("mental_health_provider"),
         emergency_contact=value("emergency_contact"),
-        hmis_id=value("hmis_id"),
+        hmis_id=value("hmis_id") or find_hmis_identifier(text),
         referenced_lease_date=referenced.group(1) if referenced else None,
         monthly_rent=find_value("Monthly rent", text) or find_value("Requested rent", text) or find_value("Tenant monthly rental amount", text),
         security_deposit=find_value("Security deposit", text),
@@ -557,6 +571,17 @@ class HomesteaderStore:
                 alias_names.append(alias["alias"])
         documents = []
         for document in self.data["documents"]:
+            # Evidence links are written when a document is processed.  They
+            # are the primary source here: a network must show the records
+            # that actually established it, even where an OCR extractor did
+            # not preserve a tidy field/value pair.
+            if entity_id in document.get("evidence_entity_ids", []):
+                documents.append({
+                    "document_id": document["id"], "name": document["original_name"],
+                    "type": document.get("extracted", {}).get("document_type", "unknown"),
+                    "document_date": document.get("extracted", {}).get("document_date"),
+                })
+                continue
             extracted = document.get("extracted") or {}
             stated = [extracted.get("landlord"), extracted.get("property_address"), extracted.get("participant"), extracted.get("tenant")]
             if any(value and normalized_entity_name(value) in searchable_names for value in stated):
@@ -845,6 +870,14 @@ class HomesteaderStore:
             if document_id and document_id not in document_ids:
                 document_ids.append(document_id)
 
+        # A document evidence link is an explicit association recorded by the
+        # store.  Reading it here makes the file resilient to older ledger
+        # events that predate the participant ledger, without falling back to
+        # unsafe name searching.
+        for document in self.data["documents"]:
+            if person_id in document.get("evidence_entity_ids", []) and document["id"] not in document_ids:
+                document_ids.append(document["id"])
+
         documents_by_id = {document["id"]: document for document in self.data["documents"]}
         documents = [
             {
@@ -1096,6 +1129,92 @@ class HomesteaderStore:
 
     def _event(self, event_type: str, subject_id: str, details: dict) -> None:
         self.data["ledger_events"].append({"id": str(uuid4()), "type": event_type, "subject_id": subject_id, "details": details, "recorded_at": now()})
+        self._record_event_document_evidence(subject_id, details)
+
+    def _record_event_document_evidence(self, subject_id: str, details: dict) -> None:
+        """Make document-to-entity evidence an invariant of every ledger event.
+
+        A workflow event that names a source document and any entity is itself
+        proof that the source supports that entity.  Keeping this rule in the
+        central event writer prevents individual workflow branches from
+        forgetting to update a separate participant-file list.
+        """
+        document_id = details.get("document_id")
+        if not document_id:
+            return
+        document = next((item for item in self.data["documents"] if item["id"] == document_id), None)
+        if not document:
+            return
+        entity_ids = {entity["id"] for entity in self.data["entities"]}
+        evidence = document.setdefault("evidence_entity_ids", [])
+        candidates = [subject_id]
+        candidates.extend(value for key, value in details.items() if key.endswith("_id") and key != "document_id")
+        for candidate in candidates:
+            if candidate in entity_ids and candidate not in evidence:
+                evidence.append(candidate)
+
+    def reconcile_document_evidence(self) -> dict:
+        """Append safe evidence links for records created before this invariant.
+
+        Reconciliation never rewrites a historical event or guesses between
+        same-name people.  It uses an exact stored HMIS identifier first, then
+        an unambiguous exact name, and records the repair as a new ledger event.
+        """
+        people = [entity for entity in self.data["entities"] if entity["kind"] == "person"]
+        by_hmis = {
+            str(entity.get("attributes", {}).get("hmis_id")).upper(): entity
+            for entity in people if entity.get("attributes", {}).get("hmis_id")
+        }
+        by_name: dict[str, list[dict]] = {}
+        for entity in people:
+            by_name.setdefault(normalized_entity_name(entity["name"]), []).append(entity)
+        entity_ids = {entity["id"] for entity in self.data["entities"]}
+        added = 0
+        participant_repairs = 0
+        for document in self.data["documents"]:
+            before = set(document.get("evidence_entity_ids", []))
+            # First recover every explicit entity already present in legacy
+            # events.  Orphan IDs are intentionally not copied forward.
+            for event in self.data["ledger_events"]:
+                details = event.get("details", {})
+                if details.get("document_id") != document["id"]:
+                    continue
+                candidates = [event.get("subject_id")]
+                candidates.extend(value for key, value in details.items() if key.endswith("_id") and key != "document_id")
+                for candidate in candidates:
+                    if candidate in entity_ids:
+                        document.setdefault("evidence_entity_ids", [])
+                        if candidate not in document["evidence_entity_ids"]:
+                            document["evidence_entity_ids"].append(candidate)
+
+            extracted = document.get("extracted") or {}
+            hmis_id = (extracted.get("hmis_id") or find_hmis_identifier(document.get("source_text", "")) or "").upper()
+            participant = by_hmis.get(hmis_id)
+            if not participant:
+                stated_name = extracted.get("participant") or extracted.get("tenant")
+                matches = by_name.get(normalized_entity_name(stated_name or ""), [])
+                participant = matches[0] if len(matches) == 1 else None
+            if participant and participant["id"] not in document.get("evidence_entity_ids", []):
+                ledger = self._participant_ledger(participant)
+                self._event("document_identity_reconciled", ledger["id"], {
+                    "document_id": document["id"], "participant_id": participant["id"],
+                    "hmis_id": hmis_id or None, "source": "exact_identifier_reconciliation",
+                })
+                participant_repairs += 1
+
+            # An entity is named directly only when its canonical name appears
+            # in this source.  This is useful evidence for landlord/property
+            # reverse lookup, but does not create an identity match by itself.
+            source_name = normalized_entity_name(document.get("source_text", ""))
+            for entity in self.data["entities"]:
+                if entity["kind"] not in {"landlord", "property", "unit", "program"}:
+                    continue
+                canonical = normalized_entity_name(entity["name"])
+                if canonical and canonical in source_name and entity["id"] not in document.get("evidence_entity_ids", []):
+                    document.setdefault("evidence_entity_ids", []).append(entity["id"])
+
+            added += len(set(document.get("evidence_entity_ids", [])) - before)
+        return {"evidence_links_added": added, "participant_repairs": participant_repairs}
 
     def _relationship(self, relationship_type: str, from_entity_id: str, to_entity_id: str, source: str) -> dict:
         existing = next((relationship for relationship in self.data["relationships"] if relationship.get("type") == relationship_type and relationship.get("from_entity_id") == from_entity_id and relationship.get("to_entity_id") == to_entity_id), None)

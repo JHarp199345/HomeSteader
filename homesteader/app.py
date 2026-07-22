@@ -43,6 +43,12 @@ def find_available_port(preferred_port: int, attempts: int = 100) -> int:
 
 
 def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
+    # Older local states may predate the evidence-link invariant. Repair only
+    # explicit, defensible links before rendering the workspace; the original
+    # events and sources remain untouched.
+    reconciliation = store.reconcile_document_evidence()
+    if reconciliation["evidence_links_added"]:
+        store.save()
     archive_dir = store.path.parent / "sources"
     exports_dir = store.path.parent / "exports"
     asset_dir = Path(__file__).resolve().parents[1] / "assets"
@@ -54,6 +60,29 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
     app.add_static_files("/homesteader-export", exports_dir)
     if asset_dir.exists():
         app.add_static_files("/homesteader-assets", asset_dir)
+
+    def render_preserved_source(document: dict, source_url: str, classes: str) -> None:
+        """Render the archived original with a browser-native fallback.
+
+        ``object`` handles PDFs more reliably than a nested browser frame on
+        desktop Safari/Chromium, while images remain directly visible.  The
+        link is intentionally retained so an operator can always inspect the
+        preserved local source even if their browser disables inline PDFs.
+        """
+        suffix = Path(document.get("stored_source_path", "")).suffix.casefold()
+        if suffix in {".png", ".jpg", ".jpeg", ".heic", ".tiff", ".webp"}:
+            ui.image(source_url).classes(classes + " object-contain bg-white border-2 border-ink rounded-lg")
+            return
+        if suffix == ".pdf":
+            ui.html(
+                f'<object data="{source_url}" type="application/pdf" class="w-full h-full">'
+                f'<p class="p-4">Inline PDF preview is unavailable. '
+                f'<a href="{source_url}" target="_blank">Open the preserved local PDF.</a></p></object>'
+            ).classes(classes + " border-2 border-ink rounded-lg bg-white overflow-hidden")
+            return
+        ui.html(f'<iframe src="{source_url}" class="w-full h-full border-0"></iframe>').classes(
+            classes + " border-2 border-ink rounded-lg bg-white overflow-hidden"
+        )
     ui.colors(primary="#1a7f7d", secondary="#d43a2c", accent="#d43a2c", positive="#1a7f7d", negative="#b83a2d")
     ui.add_head_html("""
         <style>
@@ -1212,7 +1241,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     with ui.column().classes("w-2/3 h-full gap-2"):
                         ui.label("PRESERVED ORIGINAL").classes("section-kicker")
                         if source_url:
-                            ui.html(f'<iframe src="{source_url}" class="w-full h-full border-2 border-ink rounded-lg bg-white"></iframe>').classes("w-full h-full")
+                            render_preserved_source(document, source_url, "w-full h-full")
                         else:
                             ui.label("This older record has no archived source file. The available OCR text is shown in the evidence panel.").classes("text-sm text-amber-800")
                     with ui.column().classes("w-1/3 h-full overflow-y-auto p-3 bg-cream-bright border-2 border-ink rounded-lg gap-3"):
@@ -1390,7 +1419,8 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
                 if source_url:
                     with ui.row().classes("w-full h-[600px] gap-4 flex-nowrap"):
-                        ui.html(f'<iframe src="{source_url}" class="w-2/3 h-full border-2 border-ink rounded-lg shadow-inner"></iframe>').classes("w-2/3 h-full")
+                        with ui.column().classes("w-2/3 h-full"):
+                            render_preserved_source(document, source_url, "w-full h-full shadow-inner")
                         with ui.column().classes("w-1/3 h-full overflow-y-auto p-3 bg-cream-bright border-2 border-ink rounded-lg gap-2 text-xs"):
                             ui.label("EXTRACTED EVIDENCE").classes("font-bold text-xs text-secondary uppercase tracking-wider")
                             if disposition.get("kind") == "non_viable":

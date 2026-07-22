@@ -37,6 +37,32 @@ class ReconciliationTests(unittest.TestCase):
             summary = store.participant_file(found[0]["person_id"])
             self.assertEqual(summary["documents"][0]["original_name"], "jasmine-contact.pdf")
 
+    def test_reconciliation_repairs_orphaned_legacy_document_links_by_exact_hmis_id(self):
+        """A later profile import must not strand already-preserved evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            participant = store.create_temporary_file("Jasmine Morales")
+            store.confirm_hmis_identity(participant["person_id"], "H-TRAIN-0042")
+            store.data["documents"].append({
+                "id": "legacy-quarterly", "original_name": "quarterly.pdf",
+                "source_text": "Participant paperwork\nHMIS: H-TRAIN-0042\n",
+                "extracted": {"document_type": "income_verification"},
+            })
+            # This represents an older import that referenced a profile later
+            # replaced by the current canonical HMIS record.
+            store._event("income_verification_recorded", "missing-ledger", {
+                "document_id": "legacy-quarterly", "participant_id": "orphaned-person-id",
+            })
+
+            repaired = store.reconcile_document_evidence()
+            summary = store.participant_file(participant["person_id"])
+
+            self.assertEqual(repaired["participant_repairs"], 1)
+            self.assertEqual([item["id"] for item in summary["documents"]], ["legacy-quarterly"])
+            document = store.data["documents"][0]
+            self.assertIn(participant["person_id"], document["evidence_entity_ids"])
+            self.assertTrue(any(event["type"] == "document_identity_reconciled" for event in summary["events"]))
+
     def test_participant_file_includes_a_relationship_neighborhood(self):
         with tempfile.TemporaryDirectory() as directory:
             store = HomesteaderStore(Path(directory) / "state.json")
