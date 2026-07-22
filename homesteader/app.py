@@ -42,11 +42,14 @@ def find_available_port(preferred_port: int, attempts: int = 100) -> int:
 
 def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
     archive_dir = store.path.parent / "sources"
+    exports_dir = store.path.parent / "exports"
     asset_dir = Path(__file__).resolve().parents[1] / "assets"
     archive_dir.mkdir(parents=True, exist_ok=True)
+    exports_dir.mkdir(parents=True, exist_ok=True)
     # This route exists only inside the loopback-only workspace. It exposes
     # original scans to the local browser UI, never to the network.
     app.add_static_files("/homesteader-source", archive_dir)
+    app.add_static_files("/homesteader-export", exports_dir)
     if asset_dir.exists():
         app.add_static_files("/homesteader-assets", asset_dir)
     ui.colors(primary="#1a7f7d", secondary="#d43a2c", accent="#d43a2c", positive="#1a7f7d", negative="#b83a2d")
@@ -879,6 +882,45 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                         ui.button("File with client", icon="assignment_turned_in", on_click=lambda: resolve("assign_existing")).props("no-caps")
             dialog.open()
 
+        def open_logical_export_dialog(document_id: str) -> None:
+            document = next((item for item in store.data["documents"] if item["id"] == document_id), None)
+            structure = (document or {}).get("logical_document_structure")
+            if not document or not structure:
+                ui.notify("This source does not have a recognized logical-document map.", type="warning")
+                return
+            with ui.dialog() as dialog, ui.card().classes("w-[44rem] max-w-full"):
+                ui.label("Prepare selected export").classes("text-xl font-semibold")
+                ui.label(f"{structure['title']} · {structure['page_count']} original pages").classes("text-sm muted")
+                ui.label("Choose the logical documents needed now. The archived source PDF will not be changed.").classes("text-sm")
+                destination = ui.input("Local export folder", value=str(exports_dir / datetime.now().strftime("%Y-%m-%d_%H%M%S"))).classes("w-full")
+                checks: list[tuple[dict, object]] = []
+                current_section = None
+                for part in structure["parts"]:
+                    if part["section"] != current_section:
+                        current_section = part["section"]
+                        ui.label(current_section).classes("section-kicker mt-2")
+                    checkbox = ui.checkbox(f"{part['title']} (pages {part['start_page']}–{part['end_page']})", value=False).classes("w-full")
+                    checks.append((part, checkbox))
+
+                def export_selected() -> None:
+                    selected = [part["id"] for part, checkbox in checks if checkbox.value]
+                    if not selected:
+                        ui.notify("Choose at least one logical document to export.", type="warning")
+                        return
+                    try:
+                        outputs = store.export_document_parts(document_id, selected, local_path(destination.value or ""))
+                        store.save()
+                    except (OSError, ValueError) as error:
+                        ui.notify(f"Export could not be prepared: {error}", type="negative")
+                        return
+                    dialog.close()
+                    ui.notify(f"Prepared {len(outputs)} selected document(s) locally.", type="positive")
+
+                with ui.row().classes("w-full justify-end mt-3"):
+                    ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                    ui.button("Prepare export", icon="folder_zip", on_click=export_selected).props("no-caps")
+            dialog.open()
+
         def open_document_viewer(document_id: str) -> None:
             document = next((item for item in store.data["documents"] if item["id"] == document_id), None)
             if not document:
@@ -895,6 +937,8 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 if source_url:
                     with ui.row().classes("items-center gap-2"):
                         ui.link("Open archived original in a new local tab", source_url, new_tab=True).classes("text-primary")
+                        if document.get("logical_document_structure"):
+                            ui.button("Export selected parts", icon="folder_zip", on_click=lambda: open_logical_export_dialog(document_id)).props("outline no-caps")
                         if document.get("source_format", "").casefold() in {"pdf", "png", "jpg", "jpeg", "heic", "tif", "tiff"}:
                             ui.button("Re-run local scan reader", icon="document_scanner", on_click=lambda: open_local_vision_dialog(document_id)).props("outline no-caps")
                 else:
