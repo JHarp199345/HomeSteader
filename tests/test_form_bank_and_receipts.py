@@ -64,6 +64,16 @@ class FormBankTests(unittest.TestCase):
         self.assertTrue(next(version for version in versions if version["document_id"] == "doc-newer")["is_current"])
         self.assertFalse(next(version for version in versions if version["document_id"] == "doc-older")["is_current"])
 
+    def test_form_bank_prefers_a_meaningful_original_filename_over_internal_page_labels(self):
+        self.store.data["documents"].append({
+            "id": "doc-intake", "original_name": "01. TLS Intake Packet.pdf", "source_text": "TAB 1\nInternal filing index",
+            "sha256": "intake-hash", "ingested_at": "2026-06-01T10:00:00",
+        })
+
+        result = self.store.add_form_template("doc-intake")
+
+        self.assertEqual(result["family"]["name"], "TLS Intake Packet")
+
     def test_form_bank_exact_sha256_duplicate_counter(self):
         doc1 = {
             "id": "doc-1",

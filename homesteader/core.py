@@ -2193,14 +2193,24 @@ class HomesteaderStore:
         return None
 
     def _form_template_title(self, document: dict) -> str:
-        """Use the stable form name, not a printed revision/date, as the family key."""
+        """Use a stable, operator-recognizable form name as the family key."""
+        def title_case(value: str) -> str:
+            result = value.replace("_", " ").title()
+            for acronym in ("TLS", "HMIS", "CFA", "W-9", "ADA", "HUD", "NMTC"):
+                result = re.sub(rf"\b{re.escape(acronym.title())}\b", acronym, result)
+            return result
+
+        filename_title = re.sub(r"^(?:\d{1,3}[._ -]+|blank[ _-]+)", "", Path(document["original_name"]).stem, flags=re.IGNORECASE).strip()
+        generic_filename = re.fullmatch(r"(?:scan|document|upload|untitled|image|file)(?:[ _-]?\d+)?", filename_title, re.IGNORECASE)
+        if filename_title and not generic_filename and len(re.sub(r"[^A-Za-z]", "", filename_title)) >= 4:
+            return title_case(filename_title)
         raw = next((line.strip() for line in document.get("source_text", "").splitlines() if line.strip()), document["original_name"])
         raw = re.sub(
             r"(?:\s*[.\-–—:]\s*|\s+)(?:effective|revision|revised|published)(?:\s+date)?\s*:?[ \t]*"
             r"(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}).*$",
             "", raw, flags=re.IGNORECASE,
         ).strip(" .:-–—")
-        return raw.title() or document["original_name"]
+        return title_case(raw) or document["original_name"]
 
     def add_form_template(self, document_id: str, *, title: str | None = None) -> dict:
         """Catalog one preserved blank source in its single Form Bank family."""

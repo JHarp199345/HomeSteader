@@ -126,6 +126,9 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
           .bar-btn { background: var(--cream-bright) !important; color: #123c3b !important; border: 2px solid rgba(28,29,31,.9); border-radius: 8px; }
           .bar-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; text-transform: uppercase; letter-spacing: .06em; font-size: .74rem; }
           .q-btn.bar-btn .q-btn__content, .q-btn.bar-btn .q-icon { color: #123c3b !important; }
+          .form-bank-upload { display: none !important; }
+          .form-thumbnail { width: 124px; height: 166px; flex: 0 0 124px; background: white; border: 2px solid var(--ink); border-radius: 7px; overflow: hidden; }
+          .form-thumbnail object, .form-thumbnail iframe, .form-thumbnail img { width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
 
           /* Masthead */
           .tagline-caps { font-family: "Homesteader Display", sans-serif; font-weight: 700; text-transform: uppercase; line-height: 1.04; letter-spacing: .015em; }
@@ -972,10 +975,13 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 with ui.row().classes("panel-bar bar-teal"):
                     ui.label("Form Bank").classes("bar-title")
                     with ui.row().classes("items-center gap-2"):
-                        upload = ui.upload(label="Add blank form", multiple=True, auto_upload=True).props(
-                            'accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff" flat dense no-caps'
-                        ).classes("bar-btn")
+                        upload = ui.upload(multiple=True, auto_upload=True).props(
+                            'accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff"'
+                        ).classes("form-bank-upload")
                         upload.on_upload(receive_form_bank_upload)
+                        ui.button(icon="upload", on_click=lambda: upload.run_method("pickFiles")).props(
+                            "round dense"
+                        ).classes("bar-btn").tooltip("Add blank form")
                         ui.button("Packet definitions", icon="rule", on_click=open_packet_definition_editor).props(
                             "no-caps dense"
                         ).classes("bar-btn")
@@ -993,32 +999,40 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                         reverse=False,
                     )
                     with ui.card().classes("panel w-full"):
-                        with ui.row().classes("w-full items-start justify-between flex-wrap gap-2"):
-                            with ui.column().classes("gap-0"):
+                        with ui.row().classes("w-full items-start gap-4 flex-nowrap"):
+                            current_document = next(
+                                (item for item in store.data["documents"] if any(version.get("is_current") and version["document_id"] == item["id"] for version in versions)),
+                                None,
+                            )
+                            if current_document and current_document.get("stored_source_path"):
+                                source_url = f"/homesteader-source/{Path(current_document['stored_source_path']).name}"
+                                with ui.element("div").classes("form-thumbnail"):
+                                    render_preserved_source(current_document, source_url, "w-full h-full")
+                            with ui.column().classes("gap-0 grow min-w-0"):
                                 ui.label(family["name"]).classes("text-lg font-bold text-teal-950")
                                 ui.label(
                                     f"{len(versions)} stored version{'s' if len(versions) != 1 else ''}"
                                     + (f" · {attributes.get('exact_duplicate_count', 0)} exact duplicate(s) ignored" if attributes.get("exact_duplicate_count") else "")
                                 ).classes("text-xs muted")
-                            if any(version.get("needs_template_review") for version in versions):
-                                ui.label("Version choice needs review").classes("text-xs text-amber-800 font-semibold")
-                        for version in versions:
-                            document = next((item for item in store.data["documents"] if item["id"] == version["document_id"]), None)
-                            if not document:
-                                continue
-                            with ui.row().classes("w-full items-center justify-between flex-wrap gap-2 border-t border-ink/15 pt-2 mt-2"):
-                                with ui.column().classes("gap-0"):
-                                    label = "CURRENT" if version.get("is_current") else "ARCHIVED VERSION"
-                                    ui.label(f"{label} · {version.get('filename', document['original_name'])}").classes(
-                                        "text-sm font-semibold text-teal-800" if version.get("is_current") else "text-sm"
-                                    )
-                                    source = f"Printed date: {version['effective_date']}" if version.get("effective_date") else f"Uploaded: {version.get('uploaded_at', 'unknown')}"
-                                    ui.label(source).classes("text-xs muted")
-                                with ui.row().classes("items-center gap-1"):
-                                    ui.button("Open", icon="visibility", on_click=lambda document_id=document["id"]: open_document_viewer(document_id)).props("flat dense no-caps")
-                                    ui.button("Print", icon="print", on_click=lambda document_id=document["id"]: print_form_template(document_id)).props("flat dense no-caps")
-                                    if not version.get("is_current"):
-                                        ui.button("Set current", icon="task_alt", on_click=lambda form_id=family["id"], document_id=document["id"]: set_current_form_template(form_id, document_id)).props("flat dense no-caps")
+                                if any(version.get("needs_template_review") for version in versions):
+                                    ui.label("Version choice needs review").classes("text-xs text-amber-800 font-semibold")
+                                for version in versions:
+                                    document = next((item for item in store.data["documents"] if item["id"] == version["document_id"]), None)
+                                    if not document:
+                                        continue
+                                    with ui.row().classes("w-full items-center justify-between flex-wrap gap-2 border-t border-ink/15 pt-2 mt-2"):
+                                        with ui.column().classes("gap-0"):
+                                            label = "CURRENT" if version.get("is_current") else "ARCHIVED VERSION"
+                                            ui.label(f"{label} · {version.get('filename', document['original_name'])}").classes(
+                                                "text-sm font-semibold text-teal-800" if version.get("is_current") else "text-sm"
+                                            )
+                                            source = f"Printed date: {version['effective_date']}" if version.get("effective_date") else f"Uploaded: {version.get('uploaded_at', 'unknown')}"
+                                            ui.label(source).classes("text-xs muted")
+                                        with ui.row().classes("items-center gap-1"):
+                                            ui.button("Open", icon="visibility", on_click=lambda document_id=document["id"]: open_document_viewer(document_id)).props("flat dense no-caps")
+                                            ui.button("Print", icon="print", on_click=lambda document_id=document["id"]: print_form_template(document_id)).props("flat dense no-caps")
+                                            if not version.get("is_current"):
+                                                ui.button("Set current", icon="task_alt", on_click=lambda form_id=family["id"], document_id=document["id"]: set_current_form_template(form_id, document_id)).props("flat dense no-caps")
 
         def open_review_for_document(document_id: str) -> None:
             review = next((item for item in store.data.get("review_queue", []) if item.get("document_id") == document_id and item.get("status") == "needs_review"), None)
