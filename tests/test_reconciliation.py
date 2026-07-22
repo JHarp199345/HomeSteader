@@ -65,6 +65,48 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual([row["name"] for row in confirmed_with_lease], ["Jasmine Morales"])
             self.assertEqual([row["name"] for row in temporary_files], ["Luis Rivera"])
 
+    def test_participant_documents_grouped_by_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            temporary = store.create_temporary_file("Jasmine Morales")
+            ledger = temporary["participant_ledger_id"]
+            store.data["documents"].append({
+                "id": "doc-1",
+                "original_name": "income-verif.pdf",
+                "ingested_at": "2026-07-21T10:00:00Z",
+                "extracted": {"document_type": "income_verification", "document_date": "2026-07-20"},
+            })
+            store._event("income_verification_recorded", ledger, {
+                "document_id": "doc-1", "person_id": temporary["person_id"],
+            })
+
+            groups = store.participant_documents_grouped_by_date(temporary["person_id"])
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["upload_date"], "2026-07-21")
+            self.assertEqual(groups[0]["documents"][0]["original_name"], "income-verif.pdf")
+            self.assertEqual(groups[0]["documents"][0]["status_code"], "active_export")
+
+    def test_grouped_documents_mark_pending_review_from_the_actual_review_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            temporary = store.create_temporary_file("Jasmine Morales")
+            ledger = temporary["participant_ledger_id"]
+            store.data["documents"].append({
+                "id": "doc-review", "original_name": "undated-income.pdf",
+                "ingested_at": "2026-07-21T10:00:00Z",
+                "extracted": {"document_type": "income_verification"},
+            })
+            store._event("income_verification_recorded", ledger, {
+                "document_id": "doc-review", "person_id": temporary["person_id"],
+            })
+            store.data["review_queue"].append({
+                "id": "review-1", "document_id": "doc-review", "status": "needs_review",
+            })
+
+            groups = store.participant_documents_grouped_by_date(temporary["person_id"])
+
+            self.assertEqual(groups[0]["documents"][0]["status_code"], "needs_review")
+
 
 if __name__ == "__main__":
     unittest.main()

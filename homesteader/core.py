@@ -844,6 +844,7 @@ class HomesteaderStore:
             document_id = details.get("document_id")
             if document_id and document_id not in document_ids:
                 document_ids.append(document_id)
+
         documents_by_id = {document["id"]: document for document in self.data["documents"]}
         documents = [
             {
@@ -856,6 +857,7 @@ class HomesteaderStore:
             for document_id in document_ids
             if (document := documents_by_id.get(document_id))
         ]
+
         entities = {entity["id"]: entity for entity in self.data["entities"]}
         adjacent: dict[str, list[tuple[str, str]]] = {}
         for relationship in self.data["relationships"]:
@@ -896,6 +898,93 @@ class HomesteaderStore:
             "events": sorted(relevant_events, key=lambda event: event.get("recorded_at", ""), reverse=True),
             "related_entities": sorted(nearby.values(), key=lambda item: (item["distance"], item["kind"], item["name"].casefold())),
         }
+
+    def participant_documents_grouped_by_date(self, person_id: str) -> list[dict]:
+        """Return documents associated with a participant, sectioned chronologically by upload date."""
+        summary = self.participant_file(person_id)
+        doc_ids = [doc["id"] for doc in summary.get("documents", [])]
+        documents_by_id = {doc["id"]: doc for doc in self.data.get("documents", [])}
+
+        superseded_doc_ids = set()
+        for rel in self.data.get("relationships", []):
+            if rel.get("type") == "supersedes_for_fields" and rel.get("to_document_id"):
+                superseded_doc_ids.add(rel["to_document_id"])
+
+        pending_review_doc_ids = {
+            item.get("document_id") for item in self.data.get("review_queue", [])
+            if item.get("status") == "needs_review" and item.get("document_id")
+        }
+
+        duplicate_doc_ids = set()
+        for event in self.data.get("ledger_events", []):
+            if event.get("type") == "duplicate_detected":
+                doc_id = event.get("details", {}).get("document_id")
+                if doc_id:
+                    duplicate_doc_ids.add(doc_id)
+
+        grouped: dict[str, list[dict]] = {}
+        for doc_id in doc_ids:
+            doc = documents_by_id.get(doc_id)
+            if not doc:
+                continue
+            ingested_raw = doc.get("ingested_at") or doc.get("created_at") or now()
+            upload_date_str = ingested_raw[:10]
+
+            if doc_id in pending_review_doc_ids:
+                status_code = "needs_review"
+                status_label = "Needs Review"
+                status_color = "warning"
+            elif doc_id in duplicate_doc_ids:
+                status_code = "true_duplicate"
+                status_label = "True Duplicate"
+                status_color = "grey"
+            elif doc_id in superseded_doc_ids:
+                status_code = "superseded_revision"
+                status_label = "Superseded Revision"
+                status_color = "amber"
+            else:
+                status_code = "active_export"
+                status_label = "Active Export Source"
+                status_color = "positive"
+
+            doc_entry = {
+                "id": doc["id"],
+                "original_name": doc.get("original_name", "Untitled Document"),
+                "document_type": doc.get("extracted", {}).get("document_type") or "Document",
+                "document_date": doc.get("extracted", {}).get("document_date"),
+                "reporting_period": doc.get("extracted", {}).get("reporting_period"),
+                "ingested_at": ingested_raw,
+                "upload_date": upload_date_str,
+                "status_code": status_code,
+                "status_label": status_label,
+                "status_color": status_color,
+                "source_path": doc.get("source_path"),
+                "sha256": doc.get("sha256"),
+            }
+            grouped.setdefault(upload_date_str, []).append(doc_entry)
+
+        sorted_groups = []
+        today_str = date.today().isoformat()
+        for upload_date in sorted(grouped.keys(), reverse=True):
+            docs = grouped[upload_date]
+            try:
+                dt = date.fromisoformat(upload_date)
+                formatted_date = dt.strftime("%B %d, %Y")
+            except ValueError:
+                formatted_date = upload_date
+
+            if upload_date == today_str:
+                date_label = f"Uploaded Today — {formatted_date}"
+            else:
+                date_label = f"Uploaded {formatted_date}"
+
+            sorted_groups.append({
+                "upload_date": upload_date,
+                "date_label": date_label,
+                "documents": docs,
+            })
+
+        return sorted_groups
 
     def participant_index(
         self,
@@ -1073,8 +1162,7 @@ class HomesteaderStore:
         document["text_extraction"] = {"method": extraction_method, "issue": extraction_issue}
         if extraction_issue:
             return self._review(document, extraction_issue)
-        if extraction_method == "macos_vision_ocr":
-            return self._review(document, "Text was recognized locally from a scan. Confirm the extracted facts and client association before filing.")
+
 
         revision = self._completed_revision_candidate(document, extracted)
         if revision:
@@ -1403,8 +1491,8 @@ class HomesteaderStore:
 
     def _resolve_person_for_document(self, document: dict, extracted: ExtractedDocument) -> tuple[dict | None, dict | None]:
         """Resolve without assuming documents arrive in a profile-first order."""
-        if not extracted.hmis_id:
-            return None, self._review(document, "Case document lacks an HMIS number. It cannot be automatically assigned to a participant.")
+        if not extracted.participant and not extracted.hmis_id:
+            return None, self._review(document, "Document lacks both a participant name and an HMIS number. It cannot be automatically assigned.")
         match = resolve_person(
             name=extracted.participant,
             date_of_birth=extracted.date_of_birth,
@@ -1414,8 +1502,10 @@ class HomesteaderStore:
             rows = [{"entity_id": candidate.entity_id, "name": candidate.name, "date_of_birth": candidate.date_of_birth} for candidate in self._person_candidates() if candidate.entity_id in match.candidates]
             return None, self._review(document, "; ".join(match.reasons), rows)
         if match.decision is IdentityDecision.CREATE_PROVISIONAL:
-            return self._new_entity("person", extracted.participant, date_of_birth=extracted.date_of_birth, hmis_id=extracted.hmis_id), None
+            name = extracted.participant or f"Participant {extracted.hmis_id}"
+            return self._new_entity("person", name, date_of_birth=extracted.date_of_birth, hmis_id=extracted.hmis_id), None
         return next(entity for entity in self.data["entities"] if entity["id"] == match.candidates[0]), None
+
 
     def _income_ledger(self, person: dict) -> dict:
         existing = next((entity for entity in self.data["entities"] if entity["kind"] == "income_ledger" and entity.get("attributes", {}).get("person_id") == person["id"]), None)

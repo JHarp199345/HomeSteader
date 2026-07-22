@@ -12,3 +12,7 @@ __pycache__/
 .venv/
 *.egg-info/
 node_modules
+
+# Large local-only fictional training PDFs and macOS metadata are not source.
+Homesteader Test Documents/
+.DS_Store

@@ -15,6 +15,11 @@ class ExtractionProtocolTests(unittest.TestCase):
         self.assertEqual(facts["participant"]["value"], "Jasmine Morales")
         self.assertEqual(facts["date_of_birth"]["evidence"], "Date of birth: January 15, 1990")
 
+    def test_blank_form_labels_are_not_recorded_as_participant_facts(self):
+        facts = extract_common_facts("Participant: ____________________\nHMIS ID: HMIS ID\n")
+        self.assertNotIn("participant", facts)
+        self.assertNotIn("hmis_id", facts)
+
 
 class ContactIntakeTests(unittest.TestCase):
     def setUp(self):

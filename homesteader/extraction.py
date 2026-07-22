@@ -13,11 +13,19 @@ class ExtractedFact:
     confidence: float = 1.0
 
 
+def is_template_placeholder(val: str) -> bool:
+    clean = val.strip("_.- ").casefold()
+    return len(clean) == 0 or "hmis id" in clean or "participant" in clean or "________________" in val
+
 def labeled_fact(text: str, label: str, field: str) -> ExtractedFact | None:
     match = re.search(rf"^{re.escape(label)}:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
     if not match:
         return None
-    return ExtractedFact(field=field, value=match.group(1).strip(), evidence=match.group(0).strip())
+    val = match.group(1).strip()
+    if is_template_placeholder(val):
+        return None
+    return ExtractedFact(field=field, value=val, evidence=match.group(0).strip())
+
 
 
 def extract_common_facts(text: str) -> dict[str, dict]:

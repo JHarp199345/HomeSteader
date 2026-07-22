@@ -128,6 +128,9 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
           /* Directory browse chips */
           .browse-chip { background: var(--manila); border: 2px solid var(--ink); border-radius: 999px; padding: 3px 13px; cursor: pointer; display: flex; align-items: center; gap: 5px; font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; font-size: .72rem; color: #4a4536; }
           .browse-chip:hover { background: var(--teal); color: var(--cream-bright); }
+          .browse-chip.upload-chip-teal { background: var(--teal) !important; color: var(--cream-bright) !important; border: 2px solid var(--ink); }
+          .browse-chip.upload-chip-teal:hover { background: #0d5c58 !important; color: var(--cream-bright) !important; }
+
 
           /* Stat tiles */
           .stat-tile { background: var(--cream); border: 2px solid var(--ink); border-radius: 12px; box-shadow: 5px 5px 0 rgba(28,29,31,.85); padding: 13px 16px; display: flex; gap: 14px; align-items: center; flex: 1; min-width: 215px; }
@@ -175,9 +178,22 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         </style>
     """)
 
-    active_view = {"key": "overview"}
+    active_view = {"key": "files"}
     global_search = {"query": ""}
     nav_buttons: dict[str, object] = {}
+
+    def handle_file_upload(e) -> None:
+        """Stage a user-selected file locally without overwriting a prior scan."""
+        try:
+            content = e.content.read()
+            filename = Path(getattr(e, "name", "uploaded_document.pdf")).name
+            inbox_path.mkdir(parents=True, exist_ok=True)
+            destination = inbox_path / f"upload-{uuid4()}-{filename}"
+            destination.write_bytes(content)
+            ui.notify(f"Staged '{filename}' locally. Homesteader will process it after the copy is stable.", type="positive")
+            watch_intake_folder()
+        except Exception as err:
+            ui.notify(f"Upload error: {err}", type="negative")
 
     with ui.left_drawer(value=True).props("behavior=desktop bordered").classes("app-drawer p-4"):
         with ui.column().classes("w-full items-center gap-1 mb-6"):
@@ -187,21 +203,18 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             ui.label("LOCAL WORKSPACE").classes("display-label text-[10px] tracking-widest opacity-90")
         ui.label("WORKSPACE").classes("display-label text-[10px] tracking-widest opacity-70 mb-1")
         for key, label, icon in [
-            ("overview", "Dashboard", "home"), ("review", "Errors & Review", "warning"),
-            ("reports", "Correction Reports", "summarize"), ("files", "File Index", "folder_open"),
+            ("files", "Participant Files", "folder_open"), ("review", "Errors & Review", "warning"),
+            ("overview", "Dashboard", "home"), ("reports", "Correction Reports", "summarize"),
             ("packets", "Packets & Intake", "inventory_2"), ("calendar", "Schedule", "calendar_month"),
         ]:
             nav_buttons[key] = ui.button(label, icon=icon, on_click=lambda key=key: set_active_view(key)).props("flat no-caps").classes("w-full mb-1")
         ui.separator().classes("my-3 opacity-30")
         ui.label("DATA").classes("display-label text-[10px] tracking-widest opacity-70 mb-1")
         nav_buttons["forms"] = ui.button("Form Bank", icon="article", on_click=lambda: set_active_view("forms")).props("flat no-caps").classes("w-full mb-1")
-        ui.separator().classes("my-3 opacity-30")
-        ui.label("SYSTEM").classes("display-label text-[10px] tracking-widest opacity-70 mb-1")
-        nav_buttons["queue"] = ui.button("Local queue", icon="sync", on_click=lambda: set_active_view("queue")).props("flat no-caps").classes("w-full mb-1")
         with ui.column().classes("scan-card w-full gap-0 mt-6"):
             with ui.row().classes("items-center gap-2"):
                 ui.icon("folder", size="18px")
-                ui.label("SCAN FOLDER").classes("display-label text-[10px] tracking-widest")
+                ui.label("AUTO-WATCH FOLDER").classes("display-label text-[10px] tracking-widest")
             ui.label(str(inbox_path)).classes("text-xs opacity-90 break-all")
 
     with ui.column().classes("page-shell w-full gap-5"):
@@ -224,9 +237,9 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         with ui.row().classes("tab-row flex-nowrap") as tab_bar:
             tab_elements: dict[str, object] = {}
             for key, label, icon in [
-                ("review", "Needs Review", "warning"), ("reports", "Correction Findings", "summarize"),
-                ("files", "File Index", "folder_open"), ("packets", "Packets & Intake", "inventory_2"),
-                ("calendar", "Schedule", "calendar_month"), ("forms", "Form Bank", "article"), ("queue", "Local Queue", "sync"),
+                ("files", "Participant Files", "folder_open"), ("review", "Needs Review", "warning"),
+                ("reports", "Correction Findings", "summarize"), ("packets", "Packets & Intake", "inventory_2"),
+                ("calendar", "Schedule", "calendar_month"), ("forms", "Form Bank", "article"),
             ]:
                 with ui.element("div").classes("folder-tab") as tab:
                     ui.icon(icon, size="16px")
@@ -275,9 +288,11 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         selected_packet_id: str | None = None
         queue_worker_active = False
         watched_file_signatures: dict[str, tuple[int, int]] = {}
+        active_browse = {"kind": "person"}
         participant_filters = {"query": "", "status": "all", "program": None, "has_lease": False, "date_from": None, "date_to": None}
         correction_filters = {"query": "", "caseworker": None, "program": None, "category": None, "date_from": None, "date_to": None}
         calendar_state = {"mode": "month", "anchor": date.today(), "include_documented": True}
+
 
         def metrics_values() -> list[tuple[str, int, str, str, bool]]:
             pending = len(store.pending_reviews())
@@ -526,6 +541,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.label("Needs Review").classes("bar-title")
                     if reviews:
                         ui.label(f"{len(reviews)} item{'s' if len(reviews) != 1 else ''}").classes("display-label text-sm")
+
                 if not reviews:
                     ui.label("Nothing needs review. Take five, partner.").classes("muted")
                 categories = {}
@@ -672,13 +688,37 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                             ui.icon(icon, size="14px")
                             ui.label(f"{label} ({directory_counts.get(kind, 0)})")
                         chip.on("click", lambda kind=kind: browse_kind(kind))
+
+                    with ui.element("div").classes("browse-chip upload-chip-teal") as upload_pill:
+                        ui.icon("cloud_upload", size="14px")
+                        ui.label("UPLOAD DOCS")
+                    upload_pill.on("click", lambda: open_upload_dialog())
+
                     ui.label("Similar names are never silently merged.").classes("text-xs muted")
                 results = ui.column().classes("w-full gap-2")
 
+                def open_upload_dialog() -> None:
+                    with ui.dialog() as dialog, ui.card().classes("w-[34rem] max-w-full p-5"):
+                        with ui.row().classes("w-full items-center justify-between mb-2"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("cloud_upload", size="24px").classes("text-teal-700")
+                                ui.label("Upload Documents").classes("text-xl font-semibold")
+                            ui.button(icon="close", on_click=dialog.close).props("flat round dense")
+                        ui.label("Select multiple files or drag email attachments directly to stage into your local intake folder.").classes("text-sm muted mb-3")
+                        ui.upload(
+                            label="📁 Pick or Drop Files",
+                            multiple=True,
+                            auto_upload=True,
+                            on_upload=lambda e: (handle_file_upload(e), dialog.close()),
+                        ).props("flat color=teal text-color=teal-10").classes("retro-secondary w-full")
+                    dialog.open()
+
+
                 def browse_kind(kind: str) -> None:
-                    keyword = kind_labels[kind].lower()
-                    query.value = keyword
-                    run_search()
+                    active_browse["kind"] = kind
+                    global_search["query"] = ""
+                    participant_filters["query"] = ""
+                    set_active_view("files")
 
                 def show_directory(kind: str) -> None:
                     label = kind_labels[kind]
@@ -701,15 +741,15 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 ui.button("Open profile", icon="hub", on_click=lambda entity_id=row["entity_id"]: open_entity_profile(entity_id)).props("flat no-caps dense").classes("shrink-0")
 
                 def run_search() -> None:
-                    global_search["query"] = query.value or ""
+                    global_search["query"] = (query.value or "").strip()
                     results.clear()
-                    needle = (query.value or "").strip().casefold()
-                    browse_match = browse_kind_from_query(query.value or "")
+                    needle = global_search["query"].casefold()
+                    browse_match = browse_kind_from_query(global_search["query"])
                     with results:
                         if browse_match:
                             show_directory(browse_match)
                             return
-                    matches = store.universal_search(query.value or "")
+                    matches = store.universal_search(global_search["query"])
                     with results:
                         if not needle:
                             ui.label("Start with any name, place, identifier, or file name — or browse a category above.").classes("text-sm muted")
@@ -753,10 +793,12 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                     ui.label(f"{document['name']} · {document['type'].replace('_', ' ')}").classes("text-sm muted")
                                     ui.button(icon="visibility", on_click=lambda document_id=document["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
 
+
+                search_button.on("click", run_search)
                 query.on("keydown.enter", run_search)
-                search_button.on_click(run_search)
                 if global_search["query"]:
                     run_search()
+
 
         def open_alias_dialog(entity: dict) -> None:
             with ui.dialog() as dialog, ui.card().classes("w-96"):
@@ -851,26 +893,139 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                         if document_id:
                             ui.button(icon="visibility", on_click=lambda document_id=document_id: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored form")
 
+        def open_review_for_document(document_id: str) -> None:
+            review = next((item for item in store.data.get("review_queue", []) if item.get("document_id") == document_id and item.get("status") == "needs_review"), None)
+            if review:
+                open_review_dialog(review)
+            else:
+                open_document_viewer(document_id)
+
         def refresh_participant_index() -> None:
             participant_panel.clear()
+            kind = active_browse.get("kind", "person")
             with participant_panel:
-                with ui.row().classes("panel-bar bar-teal"):
-                    ui.label("Participant Files").classes("bar-title")
-                    ui.button(icon="filter_list", color=None, on_click=open_participant_filters).classes("bar-btn").props("round dense").tooltip("Filter participant files")
-                ui.label("A compact working index, not a dashboard.").classes("text-sm muted")
-                ui.label("Use the universal search above for a specific person, landlord, property, unit, or file. Filters here are for browsing the index.").classes("text-sm muted")
-                rows = store.participant_index(**participant_filters)
-                ui.label(f"{len(rows)} participant file{'s' if len(rows) != 1 else ''}").classes("text-sm muted")
-                if not rows:
-                    ui.label("No participant files match the current search and filters.").classes("text-sm muted")
-                for row in rows[:30]:
-                    identifier = row["identifier"] or "No identifier yet"
-                    programs = ", ".join(row["programs"]) or "No program recorded"
-                    with ui.row().classes("w-full items-center justify-between"):
-                        with ui.column().classes("gap-0"):
-                            ui.label(f"{row['name']} — {identifier}").classes("text-sm font-medium")
-                            ui.label(f"{row['document_count']} document(s) · {row['lease_count']} lease(s) · {programs}").classes("text-sm muted")
-                        ui.button("Open file", icon="folder_open", on_click=lambda person_id=row["person_id"]: open_participant_file(person_id)).props("flat no-caps")
+                if kind == "landlord":
+                    with ui.row().classes("panel-bar bar-teal"):
+                        ui.label("Landlord Directory & Associated Properties").classes("bar-title")
+                    ui.label("Browse all recorded landlords, their properties, housed participants, and caseworkers.").classes("text-sm muted")
+                    rows = store.entity_directory("landlord")
+                    q = (participant_filters.get("query") or "").strip().casefold()
+                    if q:
+                        rows = [r for r in rows if q in r["name"].casefold()]
+                    ui.label(f"{len(rows)} landlord{'s' if len(rows) != 1 else ''} recorded").classes("text-sm muted")
+                    for row in rows:
+                        net = store.entity_network(row["entity_id"])
+                        props = net["connected"].get("property", [])
+                        people = net["connected"].get("person", [])
+                        with ui.expansion(f"🏢 LANDLORD: {row['name']}", value=True).classes("w-full panel p-3 my-2"):
+                            with ui.row().classes("w-full items-center justify-between mb-3 pb-2 border-b-2 border-ink/20 flex-wrap gap-2"):
+                                with ui.column().classes("gap-0"):
+                                    ui.label(f"🏢 {row['name']}").classes("text-lg font-bold text-teal-950 tracking-tight")
+                                    ui.label(f"Landlord Entity · {len(props)} Property Owned · {len(people)} Housed Participant(s) · {row['relationship_count']} Connection(s)").classes("text-xs font-semibold text-secondary")
+                                ui.button("Open Landlord Profile & Network", icon="hub", on_click=lambda eid=row["entity_id"]: open_entity_profile(eid)).props("retro-primary dense no-caps text-xs")
+                            if props:
+                                ui.label("ASSOCIATED PROPERTIES OWNED:").classes("font-semibold text-xs text-secondary uppercase tracking-wider mt-2 mb-1")
+                                for p in props:
+                                    ui.label(f" • {p['name']}").classes("text-sm font-medium ml-3 mb-1")
+                            if people:
+                                ui.label("HOUSED PARTICIPANT TENANTS:").classes("font-semibold text-xs text-secondary uppercase tracking-wider mt-2 mb-1")
+                                for person in people:
+                                    with ui.row().classes("items-center justify-between ml-3 my-1 w-full"):
+                                        ui.label(f" • {person['name']} (HMIS #{person.get('identifier') or 'N/A'})").classes("text-sm font-medium")
+                                        ui.button("Open file", icon="folder_open", on_click=lambda pid=person["entity_id"]: open_participant_file(pid)).props("flat dense no-caps text-xs")
+
+                elif kind == "property":
+                    with ui.row().classes("panel-bar bar-teal"):
+                        ui.label("Property Directory & Tenant Occupants").classes("bar-title")
+                    ui.label("Browse all recorded housing properties, unit numbers, landlords, and housed participants.").classes("text-sm muted")
+                    rows = store.entity_directory("property")
+                    q = (participant_filters.get("query") or "").strip().casefold()
+                    if q:
+                        rows = [r for r in rows if q in r["name"].casefold()]
+                    ui.label(f"{len(rows)} propert{'ies' if len(rows) != 1 else 'y'} recorded").classes("text-sm muted")
+                    for row in rows:
+                        net = store.entity_network(row["entity_id"])
+                        landlords = net["connected"].get("landlord", [])
+                        people = net["connected"].get("person", [])
+                        landlord_name = landlords[0]["name"] if landlords else "Landlord not recorded"
+                        with ui.expansion(f"🏠 PROPERTY: {row['name']}", value=True).classes("w-full panel p-3 my-2"):
+                            with ui.row().classes("w-full items-center justify-between mb-3 pb-2 border-b-2 border-ink/20 flex-wrap gap-2"):
+                                with ui.column().classes("gap-0"):
+                                    ui.label(f"🏠 {row['name']}").classes("text-lg font-bold text-teal-950 tracking-tight")
+                                    ui.label(f"Housing Property · Owner: {landlord_name} · {len(people)} Housed Tenant(s)").classes("text-xs font-semibold text-secondary")
+                                ui.button("Open Property Profile & Network", icon="hub", on_click=lambda eid=row["entity_id"]: open_entity_profile(eid)).props("retro-primary dense no-caps text-xs")
+                            if people:
+                                ui.label("CURRENT HOUSED PARTICIPANTS:").classes("font-semibold text-xs text-secondary uppercase tracking-wider mt-2 mb-1")
+                                for person in people:
+                                    with ui.row().classes("items-center justify-between ml-3 my-1 w-full"):
+                                        ui.label(f" • {person['name']} (HMIS #{person.get('identifier') or 'N/A'})").classes("text-sm font-medium")
+                                        ui.button("Open file", icon="folder_open", on_click=lambda pid=person["entity_id"]: open_participant_file(pid)).props("flat dense no-caps text-xs")
+
+
+                elif kind in {"lease", "program", "unit"}:
+                    with ui.row().classes("panel-bar bar-teal"):
+                        ui.label(f"{kind_labels.get(kind, kind.title())} Directory").classes("bar-title")
+                    ui.label(f"Browse all recorded {kind.lower()}s and their connections.").classes("text-sm muted")
+                    rows = store.entity_directory(kind)
+                    ui.label(f"{len(rows)} recorded").classes("text-sm muted")
+                    for row in rows:
+                        with ui.expansion(f"{kind.upper()}: {row['name']}", value=True).classes("w-full panel p-3 my-2"):
+                            ui.button("Open profile", icon="hub", on_click=lambda eid=row["entity_id"]: open_entity_profile(eid)).props("flat dense no-caps")
+
+                else: # Default: Participant Files
+                    with ui.row().classes("panel-bar bar-teal"):
+                        ui.label("Participant Files & Staged Records").classes("bar-title")
+                        ui.button(icon="filter_list", color=None, on_click=open_participant_filters).classes("bar-btn").props("round dense").tooltip("Filter participant files")
+                    ui.label("Organized by Client Participant, sectioned chronologically by Upload Date.").classes("text-sm muted")
+                    rows = store.participant_index(**participant_filters)
+                    ui.label(f"{len(rows)} participant file{'s' if len(rows) != 1 else ''}").classes("text-sm muted")
+                    if not rows:
+                        ui.label("No participant files match the current search and filters.").classes("text-sm muted")
+                    for row in rows[:30]:
+                        person_id = row["person_id"]
+                        identifier = row["identifier"] or "No identifier yet"
+                        programs = ", ".join(row["programs"]) or "No program recorded"
+                        with ui.expansion(f"📁 {row['name']} — {identifier} ({row['document_count']} document{'s' if row['document_count'] != 1 else ''})", value=True).classes("w-full panel p-3 my-2"):
+                            with ui.row().classes("w-full items-center justify-between mb-2 pb-2 border-b border-ink/20"):
+                                ui.label(f"Programs: {programs} · {row['lease_count']} Lease(s)").classes("text-xs muted")
+                                ui.button("Open complete file & ledger", icon="folder_open", on_click=lambda pid=person_id: open_participant_file(pid)).props("flat dense no-caps")
+
+                            date_groups = store.participant_documents_grouped_by_date(person_id)
+                            if not date_groups:
+                                ui.label("No documents linked to this participant yet.").classes("text-sm muted ml-2")
+                            else:
+                                for group in date_groups:
+                                    ui.label(group["date_label"]).classes("font-semibold text-xs text-secondary uppercase tracking-wider mt-3 mb-1 ml-1")
+                                    with ui.element("div").classes("grid grid-cols-1 md:grid-cols-2 gap-3 w-full my-2"):
+                                        for doc in group["documents"]:
+                                            with ui.card().classes("w-full p-3 bg-cream-bright border-2 border-ink rounded-lg shadow-sm flex flex-col justify-between h-full"):
+                                                with ui.column().classes("gap-1 w-full"):
+                                                    with ui.row().classes("items-center justify-between w-full flex-wrap gap-1"):
+                                                        ui.icon("description", size="18px").classes("text-teal-700 shrink-0")
+                                                        ui.label(doc["original_name"]).classes("font-semibold text-xs truncate flex-grow min-w-0")
+                                                    with ui.row().classes("items-center gap-1 flex-wrap my-1"):
+                                                        ui.badge(doc["document_type"].replace("_", " ").title(), color="teal-8").props("dense text-xs")
+                                                        pill_color = {
+                                                            "active_export": "positive",
+                                                            "superseded_revision": "amber-9",
+                                                            "needs_review": "warning",
+                                                            "true_duplicate": "grey-7"
+                                                        }.get(doc["status_code"], "grey")
+                                                        ui.badge(doc["status_label"], color=pill_color).props("dense text-xs")
+                                                    doc_details = []
+                                                    if doc.get("document_date"):
+                                                        doc_details.append(f"Date: {doc['document_date']}")
+                                                    if doc.get("reporting_period"):
+                                                        doc_details.append(f"Period: {doc['reporting_period']}")
+                                                    if doc_details:
+                                                        ui.label(" · ".join(doc_details)).classes("text-xs muted")
+
+                                                with ui.row().classes("items-center justify-end gap-1 w-full mt-2 pt-2 border-t border-ink/10"):
+                                                    ui.button("👁️ View Source PDF", icon="visibility", on_click=lambda did=doc["id"]: open_document_viewer(did)).props("retro-primary dense no-caps text-xs").tooltip("Instantly view original PDF source document")
+                                                    if doc["status_code"] == "needs_review":
+                                                        ui.button("Approve", icon="check_circle", on_click=lambda did=doc["id"]: open_review_for_document(did)).props("retro-primary dense no-caps text-xs")
+                                                        ui.button("Flag", icon="flag", on_click=lambda did=doc["id"]: open_review_for_document(did)).props("retro-secondary dense no-caps text-xs").tooltip("Flag for manual review")
+
 
         def _calendar_window() -> tuple[date, date, str]:
             anchor = calendar_state["anchor"]
@@ -1173,36 +1328,37 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 return
             stored_path = document.get("stored_source_path")
             source_url = f"/homesteader-source/{Path(stored_path).name}" if stored_path else None
-            with ui.dialog() as dialog, ui.card().classes("w-[54rem] max-w-full"):
-                with ui.row().classes("w-full items-center justify-between"):
+            with ui.dialog() as dialog, ui.card().classes("w-[68rem] max-w-full p-4"):
+                with ui.row().classes("w-full items-center justify-between border-b pb-2 mb-2"):
                     with ui.column().classes("gap-0"):
-                        ui.label(document["original_name"]).classes("text-lg font-semibold")
-                        ui.label(f"{document.get('source_format', 'unknown').upper()} · {document.get('source_size_bytes', 0):,} bytes").classes("text-sm muted")
-                    ui.button(icon="close", on_click=dialog.close).props("flat round")
-                if source_url:
+                        ui.label(document["original_name"]).classes("text-base font-bold text-teal-900")
+                        ui.label(f"{document.get('source_format', 'PDF').upper()} · {document.get('source_size_bytes', 0):,} bytes").classes("text-xs muted")
                     with ui.row().classes("items-center gap-2"):
-                        ui.link("Open archived original in a new local tab", source_url, new_tab=True).classes("text-primary")
-                        if document.get("logical_document_structure"):
-                            ui.button("Export selected parts", icon="folder_zip", on_click=lambda: open_logical_export_dialog(document_id)).props("outline no-caps")
-                        if document.get("source_format", "").casefold() in {"pdf", "png", "jpg", "jpeg", "heic", "tif", "tiff"}:
-                            ui.button("Re-run local scan reader", icon="document_scanner", on_click=lambda: open_local_vision_dialog(document_id)).props("outline no-caps")
+                        if source_url:
+                            ui.link("Open in new browser tab", source_url, new_tab=True).classes("text-xs text-primary")
+                        ui.button(icon="close", on_click=dialog.close).props("flat round dense")
+
+                if source_url:
+                    with ui.row().classes("w-full h-[600px] gap-4 flex-nowrap"):
+                        ui.html(f'<iframe src="{source_url}" class="w-2/3 h-full border-2 border-ink rounded-lg shadow-inner"></iframe>').classes("w-2/3 h-full")
+                        with ui.column().classes("w-1/3 h-full overflow-y-auto p-3 bg-cream-bright border-2 border-ink rounded-lg gap-2 text-xs"):
+                            ui.label("EXTRACTED EVIDENCE").classes("font-bold text-xs text-secondary uppercase tracking-wider")
+                            extracted = document.get("extracted") or {}
+                            for k, v in extracted.items():
+                                if v:
+                                    with ui.column().classes("gap-0 border-b border-ink/10 pb-1 w-full"):
+                                        ui.label(k.replace("_", " ").title()).classes("font-semibold text-[11px] text-teal-800")
+                                        ui.label(str(v)).classes("muted")
+                            if document.get("context_annotations"):
+                                ui.label("USER ANNOTATIONS").classes("font-bold text-xs text-secondary uppercase tracking-wider mt-2")
+                                for ann in document["context_annotations"]:
+                                    ui.label(ann["text"]).classes("muted")
+                            ui.label("RAW OCR TEXT STREAM").classes("font-bold text-xs text-secondary uppercase tracking-wider mt-2")
+                            ui.textarea(value=document.get("source_text", "")).props("readonly dense").classes("w-full text-[11px]")
                 else:
-                    ui.label("This older record has no archived original; the extracted text is still available below.").classes("text-sm text-amber-800")
-                proposals = [proposal for proposal in store.data.get("ai_proposals", []) if proposal.get("proposal", {}).get("document_id") == document_id]
-                if proposals:
-                    ui.label("Local AI proposals (review-only)").classes("font-medium mt-2")
-                    for proposal in proposals:
-                        detail = proposal["proposal"]
-                        ui.label(f"{detail['provider_id']} · {detail['document_type']} · {proposal['status']}").classes("text-sm")
-                        if detail.get("uncertainties"):
-                            ui.label("Uncertainties: " + "; ".join(detail["uncertainties"])).classes("text-xs text-amber-800")
-                if document.get("context_annotations"):
-                    ui.label("User-provided context").classes("font-medium mt-2")
-                    for annotation in document["context_annotations"]:
-                        ui.label(annotation["text"]).classes("text-sm")
-                ui.label("Extracted text / local OCR").classes("font-medium mt-2")
-                ui.textarea(value=document.get("source_text", "")).props("readonly").classes("w-full").style("min-height: 24rem")
+                    ui.label("This record has no archived source file.").classes("text-sm text-amber-800")
             dialog.open()
+
 
         def queue_local_vision_proposal(document_id: str, model_name: str = "gemma4:12b") -> dict:
             """Stage one preserved scan to local Ollama and queue its review-only output."""
@@ -1479,13 +1635,13 @@ def main() -> None:
         "--inbox",
         type=local_path,
         default=Path("inbox"),
-        help="Local or iCloud Drive folder to inspect when 'Process new scans' is selected.",
+        help="Local or approved sync folder to inspect.",
     )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     build_workspace(HomesteaderStore(args.state), args.inbox)
     port = find_available_port(args.port)
-    print(f"Homesteader is available locally at http://{LOCAL_HOST}:{port}")
+    print(f"Homesteader is available locally at http://{LOCAL_HOST}:{port} (Watching folder: {args.inbox})")
     ui.run(host=LOCAL_HOST, port=port, title="Homesteader", reload=False, show=True)
 
 
