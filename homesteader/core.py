@@ -19,6 +19,8 @@ from .extraction import extract_common_facts
 from .housing_services import add_months, load_program_schedules, schedule_for_program, write_default_program_schedules
 from .move_in import core_record_keys, load_move_in_definition, record_keys, write_default_move_in_definition
 from .ocr import recognize_image_with_vision, recognize_pdf_with_vision
+from .exporting import export_logical_parts
+from .packet_layouts import logical_document_parts
 from .proposals import AIProposal, validate_proposal
 
 
@@ -263,6 +265,20 @@ class HomesteaderStore:
     def correction_findings(self) -> list[dict]:
         """Audit local record quality without altering records or calling a service."""
         return correction_findings(self)
+
+    def export_document_parts(self, document_id: str, part_ids: list[str], destination: Path) -> list[Path]:
+        """Prepare a selected local packet export without changing evidence."""
+        document = next((item for item in self.data["documents"] if item["id"] == document_id), None)
+        if not document:
+            raise ValueError("The stored document could not be found.")
+        outputs = export_logical_parts(document, part_ids, destination)
+        self._event("logical_parts_exported", document_id, {
+            "part_ids": part_ids,
+            "destination": str(destination),
+            "output_paths": [str(item) for item in outputs],
+            "source": "explicit_local_export",
+        })
+        return outputs
 
     def initialize_program_rules(self) -> Path:
         """Write the local editable rules template once; never overwrite it."""
@@ -983,6 +999,13 @@ class HomesteaderStore:
             "stored_source_path": self._archive_source(source, content_hash, source_bytes),
             "extracted": asdict(extracted), "ingested_at": now(),
         }
+        if source.suffix.casefold() == ".pdf":
+            try:
+                structure = logical_document_parts(text, len(PdfReader(source).pages))
+            except Exception:
+                structure = None
+            if structure:
+                document["logical_document_structure"] = structure
         self.data["documents"].append(document)
 
         document["text_extraction"] = {"method": extraction_method, "issue": extraction_issue}

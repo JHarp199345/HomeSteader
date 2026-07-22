@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
+
+from homesteader.exporting import export_logical_parts
+from homesteader.packet_layouts import logical_document_parts
+
+
+class LogicalDocumentPartTests(unittest.TestCase):
+    def test_tls_intake_layout_respects_multpage_policy_as_one_logical_record(self):
+        structure = logical_document_parts(
+            "TLS TAB 1 intake checklist ... TLS TAB 6 ... grievance policy ... housing search plan",
+            47,
+        )
+
+        self.assertEqual(structure["layout_id"], "tls_intake_packet_v1")
+        grievance = next(part for part in structure["parts"] if part["id"] == "grievance_policy")
+        self.assertEqual((grievance["start_page"], grievance["end_page"]), (18, 26))
+        self.assertEqual(len(structure["parts"]), 13)
+
+    def test_selected_export_writes_only_requested_page_groups_in_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "intake.pdf"
+            writer = PdfWriter()
+            for _ in range(47):
+                writer.add_blank_page(width=612, height=792)
+            with source.open("wb") as handle:
+                writer.write(handle)
+            structure = logical_document_parts(
+                "TLS TAB 1 intake checklist ... TLS TAB 6 ... grievance policy ... housing search plan",
+                47,
+            )
+            document = {"stored_source_path": str(source), "logical_document_structure": structure}
+
+            outputs = export_logical_parts(document, ["grievance_policy", "hmis_consent"], root / "export")
+
+            self.assertEqual([path.name for path in outputs], [
+                "05_HMIS consent to share protected personal information.pdf",
+                "06_Grievance and ADA grievance policy_ forms_ and acknowledgement.pdf",
+            ])
+            self.assertEqual(len(PdfReader(outputs[0]).pages), 3)
+            self.assertEqual(len(PdfReader(outputs[1]).pages), 9)
+
+
+if __name__ == "__main__":
+    unittest.main()
