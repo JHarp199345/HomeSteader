@@ -8,6 +8,7 @@ from pypdf import PdfReader, PdfWriter
 
 from homesteader.exporting import export_logical_parts
 from homesteader.packet_layouts import logical_document_parts
+from homesteader.core import HomesteaderStore
 
 
 class LogicalDocumentPartTests(unittest.TestCase):
@@ -45,6 +46,18 @@ class LogicalDocumentPartTests(unittest.TestCase):
             ])
             self.assertEqual(len(PdfReader(outputs[0]).pages), 3)
             self.assertEqual(len(PdfReader(outputs[1]).pages), 9)
+
+    def test_local_packet_definition_is_created_once_and_can_be_adjusted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            rules_path = store.initialize_logical_layouts()
+            self.assertTrue(rules_path.exists())
+            layouts = store.logical_layouts
+            layouts[0]["parts"][0]["title"] = "Local packet index"
+            store.save_logical_layouts(layouts)
+
+            reloaded = HomesteaderStore(Path(directory) / "state.json")
+            self.assertEqual(reloaded.logical_layouts[0]["parts"][0]["title"], "Local packet index")
 
 
 if __name__ == "__main__":

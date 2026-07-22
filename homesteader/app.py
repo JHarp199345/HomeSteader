@@ -723,12 +723,65 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.button("Save alias", on_click=save_alias).props("no-caps")
             dialog.open()
 
+        def open_packet_definition_editor() -> None:
+            store.initialize_logical_layouts()
+            # This first editor handles the current known layout. More packet
+            # types can be added as independent definitions later.
+            if not store.logical_layouts:
+                ui.notify("No packet definitions are available.", type="warning")
+                return
+            layout = store.logical_layouts[0]
+            with ui.dialog() as dialog, ui.card().classes("w-[62rem] max-w-full"):
+                ui.label("Packet definition").classes("text-xl font-semibold")
+                ui.label("These are the logical records inside one source PDF. Adjusting this map affects future recognition and selected exports; it never changes archived sources.").classes("text-sm muted")
+                title = ui.input("Packet name", value=layout["title"]).classes("w-full")
+                rows: list[tuple[dict, object, object, object, object]] = []
+                with ui.row().classes("w-full gap-2 items-center"):
+                    ui.label("Logical document").classes("w-64 font-medium")
+                    ui.label("Section").classes("w-40 font-medium")
+                    ui.label("Start").classes("w-16 font-medium")
+                    ui.label("End").classes("w-16 font-medium")
+                for part in layout["parts"]:
+                    with ui.row().classes("w-full gap-2 items-center"):
+                        part_title = ui.input(value=part["title"]).classes("w-64")
+                        section = ui.input(value=part["section"]).classes("w-40")
+                        start = ui.number(value=part["start_page"], min=1, precision=0).classes("w-16")
+                        end = ui.number(value=part["end_page"], min=1, precision=0).classes("w-16")
+                        rows.append((part, part_title, section, start, end))
+
+                def save_definition() -> None:
+                    updated_parts = []
+                    try:
+                        for part, part_title, section, start, end in rows:
+                            updated_parts.append(part | {
+                                "title": (part_title.value or "").strip(),
+                                "section": (section.value or "").strip(),
+                                "start_page": int(start.value), "end_page": int(end.value),
+                            })
+                        updated_layout = layout | {"title": (title.value or "").strip(), "parts": updated_parts}
+                        layouts = [updated_layout if item["layout_id"] == layout["layout_id"] else item for item in store.logical_layouts]
+                        store.save_logical_layouts(layouts)
+                        store.save()
+                    except (TypeError, ValueError) as error:
+                        ui.notify(f"Packet definition could not be saved: {error}", type="negative")
+                        return
+                    dialog.close()
+                    ui.notify("Packet definition saved locally for future intake and export.", type="positive")
+                    refresh_workspace()
+
+                with ui.row().classes("w-full justify-end mt-3"):
+                    ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                    ui.button("Save definition", icon="save", on_click=save_definition).props("no-caps")
+            dialog.open()
+
         def refresh_form_bank() -> None:
             form_bank_panel.clear()
             with form_bank_panel:
                 with ui.row().classes("panel-bar bar-teal"):
                     ui.label("Form Bank").classes("bar-title")
+                    ui.button("Packet definitions", icon="rule", on_click=open_packet_definition_editor).props("outline no-caps").classes("bar-btn")
                 ui.label("Reusable blank forms stay here, not in a participant file.").classes("text-sm muted")
+                ui.label("Packet definitions describe the logical records inside a multi-page source, such as the TLS intake packet. They are used for selected export and future completeness rules.").classes("text-sm muted")
                 forms = [entity for entity in store.data["entities"] if entity["kind"] == "form_template"]
                 if not forms:
                     ui.label("No reusable forms cataloged yet.").classes("text-sm muted")

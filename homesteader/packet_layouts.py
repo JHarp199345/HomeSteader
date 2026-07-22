@@ -1,61 +1,81 @@
-"""Known logical-document layouts inside composite source PDFs.
-
-A scan may be one PDF while containing many logical records.  This module
-keeps the original scan intact and records page spans for human review and
-selected export.  It never splits or reorders evidence at intake time.
-"""
+"""Local, user-editable maps of logical documents inside composite PDFs."""
 
 from __future__ import annotations
 
-
-TLS_INTAKE_LAYOUT = {
-    "layout_id": "tls_intake_packet_v1",
-    "title": "TLS Intake Packet",
-    "minimum_pages": 47,
-    "parts": [
-        ("filing_index", "Packet filing index", 1, 7, "Packet index"),
-        ("participant_information", "Participant information and contact sheet", 8, 8, "Identity & intake"),
-        ("homelessness_verification", "Homelessness verification", 9, 11, "Identity & intake"),
-        ("program_agreement", "TLS program agreement and progressive assistance timeline", 12, 14, "Program documents"),
-        ("hmis_consent", "HMIS consent to share protected personal information", 15, 17, "Program documents"),
-        ("grievance_policy", "Grievance and ADA grievance policy, forms, and acknowledgement", 18, 26, "Program documents"),
-        ("client_rights", "Privacy notice and client rights and responsibilities", 27, 32, "Program documents"),
-        ("releases_and_conduct", "Media release, confidential-information release, and transportation code", 33, 35, "Program documents"),
-        ("income_declaration", "Self-declaration of income or no income", 36, 37, "Income verification"),
-        ("monthly_budget", "Monthly budget", 38, 38, "Income verification"),
-        ("nmtc_income_certification", "New Markets Tax Credit income certification", 39, 43, "Income verification"),
-        ("asset_certification", "Under-$5,000 asset certification", 44, 44, "Income verification"),
-        ("housing_search_plan", "Housing search plan and housing history", 45, 47, "Case management"),
-    ],
-}
+import json
+from pathlib import Path
 
 
-def logical_document_parts(text: str, page_count: int) -> dict | None:
-    """Recognize a known composite packet and return its human-readable map.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_LAYOUTS_PATH = PROJECT_ROOT / "config" / "logical_document_layouts.example.json"
 
-    This is intentionally strict. A similar-looking PDF stays an ordinary
-    source until a reviewer or a later layout definition identifies it.
+
+def default_layouts() -> list[dict]:
+    return json.loads(EXAMPLE_LAYOUTS_PATH.read_text())["layouts"]
+
+
+def load_logical_layouts(path: Path) -> list[dict]:
+    """Read the local packet-definition file, falling back to the example."""
+    if not path.exists():
+        return default_layouts()
+    data = json.loads(path.read_text())
+    layouts = data.get("layouts", [])
+    return layouts if isinstance(layouts, list) else default_layouts()
+
+
+def write_default_logical_layouts(path: Path) -> Path:
+    """Create a local editable copy once; never overwrite local adjustments."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(EXAMPLE_LAYOUTS_PATH.read_text())
+    return path
+
+
+def save_logical_layouts(path: Path, layouts: list[dict]) -> Path:
+    """Persist validated user-maintained definitions on this local computer."""
+    for layout in layouts:
+        if not layout.get("layout_id") or not layout.get("title"):
+            raise ValueError("Each packet definition needs an identifier and a title.")
+        for part in layout.get("parts", []):
+            start, end = int(part["start_page"]), int(part["end_page"])
+            if start < 1 or end < start:
+                raise ValueError(f"Invalid page range for '{part.get('title', 'unnamed logical document')}'.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"layouts": layouts}, indent=2) + "\n")
+    return path
+
+
+def logical_document_parts(text: str, page_count: int, layouts: list[dict] | None = None) -> dict | None:
+    """Recognize a known composite packet and return a human-readable map.
+
+    A definition matches only if its minimum page count and every configured
+    marker occur. Similar PDFs remain ordinary sources for review.
     """
     upper = text.upper()
-    if page_count < TLS_INTAKE_LAYOUT["minimum_pages"]:
-        return None
-    if "TLS TAB 1" not in upper or "TLS TAB 6" not in upper:
-        return None
-    if "GRIEVANCE" not in upper or "HOUSING SEARCH PLAN" not in upper:
-        return None
-    return {
-        "layout_id": TLS_INTAKE_LAYOUT["layout_id"],
-        "title": TLS_INTAKE_LAYOUT["title"],
-        "page_count": page_count,
-        "parts": [
-            {
-                "id": part_id,
-                "title": title,
-                "start_page": start,
-                "end_page": end,
-                "section": section,
-                "order": index,
-            }
-            for index, (part_id, title, start, end, section) in enumerate(TLS_INTAKE_LAYOUT["parts"], start=1)
-        ],
-    }
+    for layout in layouts or default_layouts():
+        if page_count < int(layout.get("minimum_pages", 1)):
+            continue
+        markers = [str(marker).upper() for marker in layout.get("recognition", {}).get("all_text_markers", [])]
+        if not markers or not all(marker in upper for marker in markers):
+            continue
+        parts = layout.get("parts", [])
+        if not parts:
+            continue
+        return {
+            "layout_id": layout["layout_id"],
+            "title": layout["title"],
+            "page_count": page_count,
+            "parts": [
+                {
+                    "id": part["id"],
+                    "title": part["title"],
+                    "start_page": int(part["start_page"]),
+                    "end_page": int(part["end_page"]),
+                    "section": part["section"],
+                    "order": index,
+                    "required_for": part.get("required_for", []),
+                }
+                for index, part in enumerate(parts, start=1)
+            ],
+        }
+    return None

@@ -20,7 +20,7 @@ from .housing_services import add_months, load_program_schedules, schedule_for_p
 from .move_in import core_record_keys, load_move_in_definition, record_keys, write_default_move_in_definition
 from .ocr import recognize_image_with_vision, recognize_pdf_with_vision
 from .exporting import export_logical_parts
-from .packet_layouts import logical_document_parts
+from .packet_layouts import load_logical_layouts, logical_document_parts, save_logical_layouts, write_default_logical_layouts
 from .proposals import AIProposal, validate_proposal
 
 
@@ -233,12 +233,14 @@ def extract_document(text: str) -> ExtractedDocument:
 class HomesteaderStore:
     """Small JSON-backed store. Events are appended; original source is preserved."""
 
-    def __init__(self, path: Path, *, program_rules_path: Path | None = None, move_in_rules_path: Path | None = None):
+    def __init__(self, path: Path, *, program_rules_path: Path | None = None, move_in_rules_path: Path | None = None, logical_layouts_path: Path | None = None):
         self.path = path
         self.program_rules_path = program_rules_path or path.parent / "program_rules.json"
         self.program_schedules = load_program_schedules(self.program_rules_path)
         self.move_in_rules_path = move_in_rules_path or path.parent / "move_in_packet.json"
         self.move_in_definition = load_move_in_definition(self.move_in_rules_path)
+        self.logical_layouts_path = logical_layouts_path or path.parent / "logical_document_layouts.json"
+        self.logical_layouts = load_logical_layouts(self.logical_layouts_path)
         self.data = self._load()
 
     def _load(self) -> dict:
@@ -293,6 +295,22 @@ class HomesteaderStore:
             write_default_move_in_definition(self.move_in_rules_path)
         self.move_in_definition = load_move_in_definition(self.move_in_rules_path)
         return self.move_in_rules_path
+
+    def initialize_logical_layouts(self) -> Path:
+        """Create the local, editable composite-packet definitions once."""
+        write_default_logical_layouts(self.logical_layouts_path)
+        self.logical_layouts = load_logical_layouts(self.logical_layouts_path)
+        return self.logical_layouts_path
+
+    def save_logical_layouts(self, layouts: list[dict]) -> Path:
+        """Save an explicit local change to the packet-definition Form Bank."""
+        saved = save_logical_layouts(self.logical_layouts_path, layouts)
+        self.logical_layouts = load_logical_layouts(saved)
+        self._event("logical_packet_definitions_updated", "logical_document_layouts", {
+            "layout_ids": [layout["layout_id"] for layout in self.logical_layouts],
+            "path": str(saved), "source": "explicit_local_form_bank_edit",
+        })
+        return saved
 
     def move_in_workflow_status(self, workflow_id: str | None = None) -> list[dict]:
         """Return local move-in readiness without making an external decision."""
@@ -1001,7 +1019,7 @@ class HomesteaderStore:
         }
         if source.suffix.casefold() == ".pdf":
             try:
-                structure = logical_document_parts(text, len(PdfReader(source).pages))
+                structure = logical_document_parts(text, len(PdfReader(source).pages), self.logical_layouts)
             except Exception:
                 structure = None
             if structure:

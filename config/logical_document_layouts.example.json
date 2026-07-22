@@ -1,0 +1,25 @@
+{
+  "layouts": [
+    {
+      "layout_id": "tls_intake_packet_v1",
+      "title": "TLS Intake Packet",
+      "minimum_pages": 47,
+      "recognition": {"all_text_markers": ["TLS TAB 1", "TLS TAB 6", "GRIEVANCE", "HOUSING SEARCH PLAN"]},
+      "parts": [
+        {"id": "filing_index", "title": "Packet filing index", "start_page": 1, "end_page": 7, "section": "Packet index", "required_for": []},
+        {"id": "participant_information", "title": "Participant information and contact sheet", "start_page": 8, "end_page": 8, "section": "Identity & intake", "required_for": ["TLS intake"]},
+        {"id": "homelessness_verification", "title": "Homelessness verification", "start_page": 9, "end_page": 11, "section": "Identity & intake", "required_for": ["TLS intake"]},
+        {"id": "program_agreement", "title": "TLS program agreement and progressive assistance timeline", "start_page": 12, "end_page": 14, "section": "Program documents", "required_for": ["TLS intake"]},
+        {"id": "hmis_consent", "title": "HMIS consent to share protected personal information", "start_page": 15, "end_page": 17, "section": "Program documents", "required_for": ["TLS intake"]},
+        {"id": "grievance_policy", "title": "Grievance and ADA grievance policy, forms, and acknowledgement", "start_page": 18, "end_page": 26, "section": "Program documents", "required_for": ["TLS intake"]},
+        {"id": "client_rights", "title": "Privacy notice and client rights and responsibilities", "start_page": 27, "end_page": 32, "section": "Program documents", "required_for": ["TLS intake"]},
+        {"id": "releases_and_conduct", "title": "Media release, confidential-information release, and transportation code", "start_page": 33, "end_page": 35, "section": "Program documents", "required_for": ["TLS intake"]},
+        {"id": "income_declaration", "title": "Self-declaration of income or no income", "start_page": 36, "end_page": 37, "section": "Income verification", "required_for": ["TLS intake", "TLS quarterly"]},
+        {"id": "monthly_budget", "title": "Monthly budget", "start_page": 38, "end_page": 38, "section": "Income verification", "required_for": ["TLS intake", "TLS quarterly"]},
+        {"id": "nmtc_income_certification", "title": "New Markets Tax Credit income certification", "start_page": 39, "end_page": 43, "section": "Income verification", "required_for": ["TLS intake", "TLS annual"]},
+        {"id": "asset_certification", "title": "Under-$5,000 asset certification", "start_page": 44, "end_page": 44, "section": "Income verification", "required_for": ["TLS intake", "TLS annual"]},
+        {"id": "housing_search_plan", "title": "Housing search plan and housing history", "start_page": 45, "end_page": 47, "section": "Case management", "required_for": ["TLS intake"]}
+      ]
+    }
+  ]
+}
