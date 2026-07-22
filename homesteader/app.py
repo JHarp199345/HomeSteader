@@ -86,6 +86,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
     ui.colors(primary="#1a7f7d", secondary="#d43a2c", accent="#d43a2c", positive="#1a7f7d", negative="#b83a2d")
     ui.add_head_html("""
         <style>
+
           @font-face {
             font-family: "Homesteader Script";
             src: url("/homesteader-assets/fonts/Lobster-Regular.ttf") format("truetype");
@@ -124,6 +125,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
           .panel-bar .bar-title { font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; font-size: 1.02rem; }
           .bar-btn { background: var(--cream-bright) !important; color: #123c3b !important; border: 2px solid rgba(28,29,31,.9); border-radius: 8px; }
           .bar-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; text-transform: uppercase; letter-spacing: .06em; font-size: .74rem; }
+          .q-btn.bar-btn .q-btn__content, .q-btn.bar-btn .q-icon { color: #123c3b !important; }
 
           /* Masthead */
           .tagline-caps { font-family: "Homesteader Display", sans-serif; font-weight: 700; text-transform: uppercase; line-height: 1.04; letter-spacing: .015em; }
@@ -345,6 +347,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 ui.label(str(value)).classes("stat-number" if alert else "stat-number stat-teal-number")
                                 ui.label(label).classes("stat-label")
                             ui.label(caption).classes("text-xs muted")
+
 
         def selected_packet() -> dict | None:
             return next((packet for packet in store.open_intake_packets() if packet["id"] == selected_packet_id), None)
@@ -907,24 +910,115 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.button("Save definition", icon="save", on_click=save_definition).props("no-caps")
             dialog.open()
 
+        def print_form_template(document_id: str) -> None:
+            """Ask the local browser to print one preserved Form Bank source."""
+            document = next((item for item in store.data["documents"] if item["id"] == document_id), None)
+            if not document or not document.get("stored_source_path"):
+                ui.notify("This form has no preserved local source to print.", type="warning")
+                return
+            source_url = f"/homesteader-source/{Path(document['stored_source_path']).name}"
+            # A temporary same-origin frame keeps the action local. If a browser
+            # blocks PDF frame printing, the regular document viewer still has
+            # an Open-in-new-tab link with the browser's native print controls.
+            ui.run_javascript(
+                """
+                (() => {
+                  const frame = document.createElement('iframe');
+                  frame.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;border:0';
+                  frame.src = %s;
+                  frame.onload = () => window.setTimeout(() => {
+                    try { frame.contentWindow.focus(); frame.contentWindow.print(); }
+                    catch (_) { window.open(frame.src, '_blank'); }
+                  }, 350);
+                  document.body.appendChild(frame);
+                  window.setTimeout(() => frame.remove(), 60000);
+                })();
+                """ % json.dumps(source_url)
+            )
+
+        def receive_form_bank_upload(event) -> None:
+            """Archive a human-designated reusable blank form without filing it."""
+            inbox_path.mkdir(parents=True, exist_ok=True)
+            destination = inbox_path / f"form-bank-{uuid4()}-{Path(event.name).name}"
+            destination.write_bytes(event.content.read())
+            try:
+                result = store.ingest(destination, form_bank=True)
+                store.save()
+            except (OSError, ValueError) as error:
+                ui.notify(f"Form could not be added: {error}", type="negative")
+                return
+            action = result.get("template_action") or result.get("action")
+            messages = {
+                "version_added": "Blank form added to the local Form Bank.",
+                "exact_duplicate": "That exact blank form is already cataloged; its duplicate was recorded.",
+                "already_cataloged": "That blank form is already in the Form Bank.",
+            }
+            ui.notify(messages.get(action, "Blank form preserved in the local Form Bank."), type="positive")
+            refresh_workspace()
+
+        def set_current_form_template(form_id: str, document_id: str) -> None:
+            try:
+                store.set_form_template_current(form_id, document_id)
+                store.save()
+            except ValueError as error:
+                ui.notify(str(error), type="negative")
+                return
+            ui.notify("Current blank-form version selected locally.", type="positive")
+            refresh_workspace()
+
         def refresh_form_bank() -> None:
             form_bank_panel.clear()
             with form_bank_panel:
                 with ui.row().classes("panel-bar bar-teal"):
                     ui.label("Form Bank").classes("bar-title")
-                    ui.button("Packet definitions", icon="rule", on_click=open_packet_definition_editor).props("outline no-caps").classes("bar-btn")
-                ui.label("Reusable blank forms stay here, not in a participant file.").classes("text-sm muted")
-                ui.label("Packet definitions describe the logical records inside a multi-page source, such as the TLS intake packet. They are used for selected export and future completeness rules.").classes("text-sm muted")
-                forms = [entity for entity in store.data["entities"] if entity["kind"] == "form_template"]
-                if not forms:
-                    ui.label("No reusable forms cataloged yet.").classes("text-sm muted")
-                for form in forms:
-                    event = next((entry for entry in reversed(store.data["ledger_events"]) if entry["type"] == "form_cataloged" and entry["subject_id"] == form["id"]), None)
-                    document_id = event.get("details", {}).get("document_id") if event else None
-                    with ui.row().classes("w-full items-center justify-between"):
-                        ui.label(form["name"]).classes("text-sm")
-                        if document_id:
-                            ui.button(icon="visibility", on_click=lambda document_id=document_id: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored form")
+                    with ui.row().classes("items-center gap-2"):
+                        upload = ui.upload(label="Add blank form", multiple=True, auto_upload=True).props(
+                            'accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff" flat dense no-caps'
+                        ).classes("bar-btn")
+                        upload.on_upload(receive_form_bank_upload)
+                        ui.button("Packet definitions", icon="rule", on_click=open_packet_definition_editor).props(
+                            "no-caps dense"
+                        ).classes("bar-btn")
+                ui.label("Reusable blank forms stay here, separate from participant files. Open or print the locally preserved current version whenever you need a working copy.").classes("text-sm muted")
+                ui.label("A printed effective, revision, or published date wins. When a form has no printed version date, the most recently uploaded copy is current. Exact copies are deduplicated.").classes("text-sm muted")
+                families = store.form_bank_families()
+                if not families:
+                    ui.label("No reusable forms cataloged yet. Use Add blank form to build the local bank.").classes("text-sm muted")
+                    return
+                for family in families:
+                    attributes = family.get("attributes", {})
+                    versions = sorted(
+                        attributes.get("versions", []),
+                        key=lambda item: (not item.get("is_current", False), item.get("effective_date") or "", item.get("uploaded_at") or ""),
+                        reverse=False,
+                    )
+                    with ui.card().classes("panel w-full"):
+                        with ui.row().classes("w-full items-start justify-between flex-wrap gap-2"):
+                            with ui.column().classes("gap-0"):
+                                ui.label(family["name"]).classes("text-lg font-bold text-teal-950")
+                                ui.label(
+                                    f"{len(versions)} stored version{'s' if len(versions) != 1 else ''}"
+                                    + (f" · {attributes.get('exact_duplicate_count', 0)} exact duplicate(s) ignored" if attributes.get("exact_duplicate_count") else "")
+                                ).classes("text-xs muted")
+                            if any(version.get("needs_template_review") for version in versions):
+                                ui.label("Version choice needs review").classes("text-xs text-amber-800 font-semibold")
+                        for version in versions:
+                            document = next((item for item in store.data["documents"] if item["id"] == version["document_id"]), None)
+                            if not document:
+                                continue
+                            with ui.row().classes("w-full items-center justify-between flex-wrap gap-2 border-t border-ink/15 pt-2 mt-2"):
+                                with ui.column().classes("gap-0"):
+                                    label = "CURRENT" if version.get("is_current") else "ARCHIVED VERSION"
+                                    ui.label(f"{label} · {version.get('filename', document['original_name'])}").classes(
+                                        "text-sm font-semibold text-teal-800" if version.get("is_current") else "text-sm"
+                                    )
+                                    source = f"Printed date: {version['effective_date']}" if version.get("effective_date") else f"Uploaded: {version.get('uploaded_at', 'unknown')}"
+                                    ui.label(source).classes("text-xs muted")
+                                with ui.row().classes("items-center gap-1"):
+                                    ui.button("Open", icon="visibility", on_click=lambda document_id=document["id"]: open_document_viewer(document_id)).props("flat dense no-caps")
+                                    ui.button("Print", icon="print", on_click=lambda document_id=document["id"]: print_form_template(document_id)).props("flat dense no-caps")
+                                    if not version.get("is_current"):
+                                        ui.button("Set current", icon="task_alt", on_click=lambda form_id=family["id"], document_id=document["id"]: set_current_form_template(form_id, document_id)).props("flat dense no-caps")
 
         def open_review_for_document(document_id: str) -> None:
             review = next((item for item in store.data.get("review_queue", []) if item.get("document_id") == document_id and item.get("status") == "needs_review"), None)

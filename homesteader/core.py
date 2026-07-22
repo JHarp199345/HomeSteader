@@ -282,6 +282,65 @@ class HomesteaderStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2) + "\n")
 
+    def reconcile_document_evidence(self) -> dict:
+        """Append safe evidence links for records created before this invariant.
+
+        Reconciliation never rewrites a historical event or guesses between
+        same-name people. It uses an exact stored HMIS identifier first, then
+        an unambiguous exact name, and records the repair as a new ledger event.
+        """
+        people = [entity for entity in self.data["entities"] if entity["kind"] == "person"]
+        by_hmis = {
+            str(entity.get("attributes", {}).get("hmis_id")).upper(): entity
+            for entity in people if entity.get("attributes", {}).get("hmis_id")
+        }
+        by_name: dict[str, list[dict]] = {}
+        for entity in people:
+            by_name.setdefault(normalized_entity_name(entity["name"]), []).append(entity)
+        entity_ids = {entity["id"] for entity in self.data["entities"]}
+        added = 0
+        participant_repairs = 0
+        for document in self.data["documents"]:
+            before = set(document.get("evidence_entity_ids", []))
+            for event in self.data["ledger_events"]:
+                details = event.get("details", {})
+                if details.get("document_id") != document["id"]:
+                    continue
+                candidates = [event.get("subject_id")]
+                candidates.extend(value for key, value in details.items() if key.endswith("_id") and key != "document_id")
+                for candidate in candidates:
+                    if candidate in entity_ids and candidate not in document.setdefault("evidence_entity_ids", []):
+                        document["evidence_entity_ids"].append(candidate)
+
+            extracted = document.get("extracted") or {}
+            hmis_id = (extracted.get("hmis_id") or find_hmis_identifier(document.get("source_text", "")) or "").upper()
+            participant = by_hmis.get(hmis_id)
+            if not participant:
+                stated_name = extracted.get("participant") or extracted.get("tenant")
+                matches = by_name.get(normalized_entity_name(stated_name or ""), [])
+                participant = matches[0] if len(matches) == 1 else None
+            if participant and participant["id"] not in document.get("evidence_entity_ids", []):
+                ledger = self._participant_ledger(participant)
+                self._event("document_identity_reconciled", ledger["id"], {
+                    "document_id": document["id"], "participant_id": participant["id"],
+                    "hmis_id": hmis_id or None, "source": "exact_identifier_reconciliation",
+                })
+                participant_repairs += 1
+
+            source_name = normalized_entity_name(document.get("source_text", ""))
+            for entity in self.data["entities"]:
+                if entity["kind"] not in {"landlord", "property", "unit", "program"}:
+                    continue
+                canonical = normalized_entity_name(entity["name"])
+                address_only = canonical.split(" unit ", 1)[0].rstrip(", ")
+                directly_named = canonical in source_name or (
+                    entity["kind"] == "property" and len(address_only) > 6 and address_only in source_name
+                )
+                if directly_named and entity["id"] not in document.get("evidence_entity_ids", []):
+                    document.setdefault("evidence_entity_ids", []).append(entity["id"])
+            added += len(set(document.get("evidence_entity_ids", [])) - before)
+        return {"evidence_links_added": added, "participant_repairs": participant_repairs}
+
     def correction_findings(self) -> list[dict]:
         """Audit local record quality without altering records or calling a service."""
         return correction_findings(self)
@@ -1279,7 +1338,7 @@ class HomesteaderStore:
                 return prior, improvements
         return None
 
-    def ingest(self, source: Path, *, packet_id: str | None = None, original_name: str | None = None) -> dict:
+    def ingest(self, source: Path, *, packet_id: str | None = None, original_name: str | None = None, form_bank: bool = False) -> dict:
         text, extraction_issue, extraction_method = self._extract_source_text(source)
         extracted = extract_document(text)
         source_bytes = source.read_bytes()
@@ -1290,6 +1349,13 @@ class HomesteaderStore:
         duplicate = next((item for item in self.data["documents"] if item["sha256"] == content_hash), None)
         if duplicate:
             self._event("duplicate_candidate_detected", duplicate["id"], {"intake_occurrence_id": occurrence["id"], "attempted_name": source.name, "sha256": content_hash, "source": "exact_content_hash"})
+            if form_bank and duplicate.get("staging_disposition", {}).get("kind") == "form_template":
+                template = self.add_form_template(duplicate["id"])
+                if template["action"] == "already_cataloged":
+                    attributes = template["family"].setdefault("attributes", {})
+                    attributes["exact_duplicate_count"] = attributes.get("exact_duplicate_count", 0) + 1
+                    template["action"] = "exact_duplicate"
+                return {"status": "form_bank_duplicate", "document_id": duplicate["id"], "template_action": template["action"]}
             return self._review_existing(
                 duplicate,
                 f"Exact content match. Confirm whether this is an accidental duplicate or a separate recurring intake occurrence.",
@@ -1313,6 +1379,11 @@ class HomesteaderStore:
         self.data["documents"].append(document)
 
         document["text_extraction"] = {"method": extraction_method, "issue": extraction_issue}
+        if form_bank:
+            # The user explicitly chose the Form Bank, so this is a recorded
+            # human designation rather than a classifier guess. The original
+            # stays preserved and can be reopened if it was selected in error.
+            return self._catalog_form(document)
         if extraction_issue:
             return self._review(document, extraction_issue)
 
@@ -1756,10 +1827,12 @@ class HomesteaderStore:
         }
 
     def _catalog_form(self, document: dict) -> dict:
-        title = next((line.strip().title() for line in document["source_text"].splitlines() if line.strip()), document["original_name"])
-        form = self._entity("form_template", title)
+        title = self._form_template_title(document)
+        template = self.add_form_template(document["id"], title=title)
+        form = template["family"]
         self._event("form_cataloged", form["id"], {"document_id": document["id"], "source": "characteristic_classification", "reason": "Blank form title with no completed identity fields."})
-        return {"status": "filed", "document_id": document["id"], "form_id": form["id"], "destination": "form_bank", "confidence": 0.95, "reasons": ["Recognized blank form title", "No tenant, premises, or signature fields were completed"]}
+        return {"status": "filed", "document_id": document["id"], "form_id": form["id"], "destination": "form_bank", "template_action": template["action"], "confidence": 0.95, "reasons": ["Recognized blank form title", "No tenant, premises, or signature fields were completed"]}
+
 
     def _create_lease(self, document: dict, extracted: ExtractedDocument) -> dict:
         if not all([extracted.tenant, extracted.property_address, extracted.unit, extracted.signed_date]):
@@ -2002,6 +2075,7 @@ class HomesteaderStore:
             form_result = self._catalog_form(document)
             resolution["form_id"] = form_result["form_id"]
             item["resolution"] = resolution
+
         if action == "archive_non_viable" and document:
             disposition = {
                 "kind": "non_viable", "reason": note.strip(), "review_id": review_id,
@@ -2100,3 +2174,104 @@ class HomesteaderStore:
                 unit_label = entity["name"].rsplit(" / ", 1)[-1].casefold()
                 if unit_label and re.search(rf"\bunit\s+{re.escape(unit_label)}\b", note):
                     self._relationship("context_mentions_unit", evidence["id"], entity["id"], "user_context_note")
+
+    def _template_effective_date(self, source_text: str) -> str | None:
+        """Return a normalized printed effective/revision date when one is clear."""
+        match = re.search(
+            r"\b(?:effective|revision|revised|published)(?:\s+date)?\s*:?[ \t]*"
+            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b",
+            source_text, re.IGNORECASE,
+        )
+        if not match:
+            return None
+        raw = match.group(1)
+        for pattern in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%Y/%m/%d", "%m/%d/%y"):
+            try:
+                return datetime.strptime(raw, pattern).date().isoformat()
+            except ValueError:
+                continue
+        return None
+
+    def _form_template_title(self, document: dict) -> str:
+        """Use the stable form name, not a printed revision/date, as the family key."""
+        raw = next((line.strip() for line in document.get("source_text", "").splitlines() if line.strip()), document["original_name"])
+        raw = re.sub(
+            r"(?:\s*[.\-–—:]\s*|\s+)(?:effective|revision|revised|published)(?:\s+date)?\s*:?[ \t]*"
+            r"(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}).*$",
+            "", raw, flags=re.IGNORECASE,
+        ).strip(" .:-–—")
+        return raw.title() or document["original_name"]
+
+    def add_form_template(self, document_id: str, *, title: str | None = None) -> dict:
+        """Catalog one preserved blank source in its single Form Bank family."""
+        document = next((item for item in self.data["documents"] if item["id"] == document_id), None)
+        if not document:
+            raise ValueError("Document does not exist.")
+        title = title or self._form_template_title(document)
+        family = self._entity("form_template", title)
+        attributes = family.setdefault("attributes", {})
+        versions = attributes.setdefault("versions", [])
+        for version in versions:
+            if version["document_id"] == document_id:
+                return {"family": family, "action": "already_cataloged"}
+            if document.get("sha256") and version.get("sha256") == document.get("sha256"):
+                attributes["exact_duplicate_count"] = attributes.get("exact_duplicate_count", 0) + 1
+                return {"family": family, "action": "exact_duplicate"}
+        version = {
+            "document_id": document_id,
+            "filename": document["original_name"],
+            "effective_date": self._template_effective_date(document.get("source_text", "")),
+            "uploaded_at": document.get("ingested_at") or now(),
+            "sha256": document.get("sha256"),
+            "is_current": False,
+            "needs_template_review": False,
+        }
+        versions.append(version)
+        self._reevaluate_form_family_precedence(family)
+        disposition = {"kind": "form_template", "form_id": family["id"], "recorded_at": now(), "source": "form_bank"}
+        document["staging_disposition"] = disposition
+        document.setdefault("staging_disposition_history", []).append(disposition.copy())
+        self._event("form_template_version_cataloged", family["id"], {"document_id": document_id, "form_id": family["id"], "source": "form_bank"})
+        return {"family": family, "action": "version_added", "version": version}
+
+    def _reevaluate_form_family_precedence(self, family: dict) -> None:
+        versions = family.setdefault("attributes", {}).setdefault("versions", [])
+        for version in versions:
+            version["is_current"] = False
+            version["needs_template_review"] = False
+        if not versions:
+            return
+        ordered = sorted(versions, key=lambda item: (bool(item.get("effective_date")), item.get("effective_date") or "", item.get("uploaded_at") or ""), reverse=True)
+        ordered[0]["is_current"] = True
+        if len(ordered) > 1 and not ordered[0].get("effective_date") and not ordered[1].get("effective_date") and ordered[0].get("uploaded_at") == ordered[1].get("uploaded_at"):
+            ordered[0]["needs_template_review"] = True
+            ordered[1]["needs_template_review"] = True
+
+    def form_bank_families(self) -> list[dict]:
+        """Return reusable template families, migrating earlier catalog events once."""
+        for family in [entity for entity in self.data["entities"] if entity["kind"] == "form_template"]:
+            attributes = family.setdefault("attributes", {})
+            attributes.setdefault("versions", [])
+            attributes.setdefault("exact_duplicate_count", 0)
+            cataloged = [event for event in self.data["ledger_events"] if event["type"] == "form_cataloged" and event["subject_id"] == family["id"]]
+            known = {version["document_id"] for version in attributes["versions"]}
+            for event in cataloged:
+                document_id = event.get("details", {}).get("document_id")
+                if document_id and document_id not in known:
+                    self.add_form_template(document_id, title=family["name"])
+                    known.add(document_id)
+            self._reevaluate_form_family_precedence(family)
+        return sorted((entity for entity in self.data["entities"] if entity["kind"] == "form_template"), key=lambda item: item["name"].casefold())
+
+    def set_form_template_current(self, form_id: str, document_id: str) -> dict:
+        family = next((entity for entity in self.data["entities"] if entity["id"] == form_id and entity["kind"] == "form_template"), None)
+        if not family:
+            raise ValueError("Form family does not exist.")
+        versions = family.setdefault("attributes", {}).setdefault("versions", [])
+        if not any(version["document_id"] == document_id for version in versions):
+            raise ValueError("Template version does not exist in this family.")
+        for version in versions:
+            version["is_current"] = version["document_id"] == document_id
+            version["needs_template_review"] = False
+        self._event("form_template_current_selected", family["id"], {"document_id": document_id, "form_id": family["id"], "source": "human_review"})
+        return family
