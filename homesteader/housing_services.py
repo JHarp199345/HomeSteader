@@ -93,8 +93,21 @@ def load_program_schedules(path: Path | None = None) -> tuple[ProgramSchedule, .
     if not path or not path.exists():
         return DEFAULT_PROGRAM_SCHEDULES
     payload = json.loads(path.read_text())
+    # The first prototype shipped exactly one generic TLS rule. Upgrade only
+    # that unmistakable old default in memory; deliberately customized local
+    # schedules remain under the user's control.
+    programs = payload.get("programs", [])
+    if len(programs) == 1:
+        legacy = programs[0]
+        legacy_requirements = legacy.get("scheduled_requirements", [])
+        if (
+            legacy.get("key") == "tls" and len(legacy_requirements) == 1
+            and legacy_requirements[0].get("key") == "income_verification"
+            and "cadence" not in legacy_requirements[0]
+        ):
+            return DEFAULT_PROGRAM_SCHEDULES
     schedules = []
-    for item in payload.get("programs", []):
+    for item in programs:
         requirements = tuple(
             ScheduledRequirement(
                 key=requirement["key"], label=requirement["label"],

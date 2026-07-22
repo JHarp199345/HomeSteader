@@ -210,3 +210,11 @@ Reporting period: Quarterly recertification - March 2026
             rules.write_text("""{"programs":[{"key":"short_tls","display_name":"Short TLS","match_terms":["short tls"],"duration_months":6,"scheduled_requirements":[]}]}""")
             store = HomesteaderStore(folder / "state.json", program_rules_path=rules)
             self.assertEqual(store.program_schedules[0].duration_months, 6)
+
+    def test_exact_legacy_tls_default_uses_the_new_explicit_schedule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            rules = folder / "program_rules.json"
+            rules.write_text("""{"programs":[{"key":"tls","display_name":"Transitional Living Services","match_terms":["tls"],"duration_months":24,"scheduled_requirements":[{"key":"income_verification","label":"income eligibility / verification","event_types":["income_verification_recorded"],"every_months":3}]}]}""")
+            store = HomesteaderStore(folder / "state.json", program_rules_path=rules)
+            self.assertEqual([item.key for item in store.program_schedules[0].scheduled_requirements], ["monthly_cfa", "quarterly_income_verification", "annual_recertification"])
