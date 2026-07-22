@@ -47,16 +47,20 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
     # explicit, defensible links before rendering the workspace; the original
     # events and sources remain untouched.
     reconciliation = store.reconcile_document_evidence()
-    if reconciliation["evidence_links_added"]:
+    thumbnails_created = store.ensure_form_bank_thumbnails()
+    if reconciliation["evidence_links_added"] or thumbnails_created:
         store.save()
     archive_dir = store.path.parent / "sources"
+    thumbnail_dir = store.path.parent / "thumbnails"
     exports_dir = store.path.parent / "exports"
     asset_dir = Path(__file__).resolve().parents[1] / "assets"
     archive_dir.mkdir(parents=True, exist_ok=True)
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
     exports_dir.mkdir(parents=True, exist_ok=True)
     # This route exists only inside the loopback-only workspace. It exposes
     # original scans to the local browser UI, never to the network.
     app.add_static_files("/homesteader-source", archive_dir)
+    app.add_static_files("/homesteader-thumbnail", thumbnail_dir)
     app.add_static_files("/homesteader-export", exports_dir)
     if asset_dir.exists():
         app.add_static_files("/homesteader-assets", asset_dir)
@@ -946,6 +950,8 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             destination.write_bytes(event.content.read())
             try:
                 result = store.ingest(destination, form_bank=True)
+                if result.get("document_id"):
+                    store.ensure_form_thumbnail(result["document_id"])
                 store.save()
             except (OSError, ValueError) as error:
                 ui.notify(f"Form could not be added: {error}", type="negative")
@@ -1005,9 +1011,12 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 None,
                             )
                             if current_document and current_document.get("stored_source_path"):
-                                source_url = f"/homesteader-source/{Path(current_document['stored_source_path']).name}"
+                                thumbnail_path = current_document.get("thumbnail_path") or store.ensure_form_thumbnail(current_document["id"])
                                 with ui.element("div").classes("form-thumbnail"):
-                                    render_preserved_source(current_document, source_url, "w-full h-full")
+                                    if thumbnail_path:
+                                        ui.image(f"/homesteader-thumbnail/{Path(thumbnail_path).name}").classes("w-full h-full object-cover")
+                                    else:
+                                        ui.icon("description", size="42px").classes("text-teal-800 mt-14 ml-10")
                             with ui.column().classes("gap-0 grow min-w-0"):
                                 ui.label(family["name"]).classes("text-lg font-bold text-teal-950")
                                 ui.label(

@@ -7,6 +7,8 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from uuid import uuid4
 
 from pypdf import PdfReader
@@ -881,6 +883,61 @@ class HomesteaderStore:
         if not archived.exists():
             archived.write_bytes(source_bytes)
         return str(archived.relative_to(self.path.parent))
+
+    def ensure_form_thumbnail(self, document_id: str) -> str | None:
+        """Create a local first-page PNG preview for a Form Bank PDF when needed.
+
+        The thumbnail is a convenience copy only. The preserved PDF remains the
+        source of truth, and no renderer or document is sent off the computer.
+        """
+        document = next((item for item in self.data["documents"] if item["id"] == document_id), None)
+        if not document or not document.get("stored_source_path"):
+            return None
+        existing = document.get("thumbnail_path")
+        if existing and (self.path.parent / existing).exists():
+            return existing
+        source = self.path.parent / document["stored_source_path"]
+        suffix = source.suffix.casefold()
+        if suffix in IMAGE_INTAKE_SUFFIXES:
+            document["thumbnail_path"] = document["stored_source_path"]
+            return document["thumbnail_path"]
+        if suffix != ".pdf" or not source.exists():
+            return None
+        mac_preview = shutil.which("sips")
+        renderer = shutil.which("pdftoppm")
+        if not mac_preview and not renderer:
+            return None
+        thumbnail_dir = self.path.parent / "thumbnails"
+        thumbnail_dir.mkdir(parents=True, exist_ok=True)
+        output = thumbnail_dir / f"{document['sha256']}.png"
+        if not output.exists():
+            try:
+                if mac_preview:
+                    subprocess.run(
+                        [mac_preview, "-s", "format", "png", "-Z", "500", str(source), "--out", str(output)],
+                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                if not output.exists() and renderer:
+                    subprocess.run(
+                        [renderer, "-f", "1", "-singlefile", "-png", "-scale-to-x", "360", "-scale-to-y", "500", str(source), str(output.with_suffix(""))],
+                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+            except OSError:
+                return None
+        if not output.exists():
+            return None
+        document["thumbnail_path"] = str(output.relative_to(self.path.parent))
+        return document["thumbnail_path"]
+
+    def ensure_form_bank_thumbnails(self) -> int:
+        """Prepare thumbnails only for already-cataloged reusable form sources."""
+        created = 0
+        for family in self.form_bank_families():
+            for version in family.get("attributes", {}).get("versions", []):
+                document = next((item for item in self.data["documents"] if item["id"] == version.get("document_id")), None)
+                if document and not document.get("thumbnail_path") and self.ensure_form_thumbnail(document["id"]):
+                    created += 1
+        return created
 
     def _entity(self, kind: str, name: str) -> dict:
         existing = next((e for e in self.data["entities"] if e["kind"] == kind and e["name"] == name), None)
