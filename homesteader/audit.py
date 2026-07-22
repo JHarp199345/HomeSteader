@@ -12,6 +12,7 @@ RECOMMENDATIONS = {
     "other_review": "Review the source document and record the necessary correction or filing decision.",
     "temporary_identity": "Verify the participant HMIS number and replace the temporary identifier only after confirmation.",
     "source_archive_missing": "Restore the original source file from the approved intake location or backup before relying on extracted metadata.",
+    "ingestion_integrity": "Re-ingest the original source through Homesteader's local intake path. Do not rely on a record that lacks its preserved-source evidence trail.",
     "scheduled_record_missing": "Verify whether this scheduled record was completed and upload or document the appropriate record. If an approved exception applies, record that exception in the participant ledger.",
     "revision_confirmation": "Compare both source documents. Confirm the newer copy only if it is the same document instance and its additional fields are supported by the source.",
     "move_in_fact_conflict": "Compare the cited original records, determine the correct value through the appropriate casework process, and preserve the conflicting source records rather than overwriting either one.",
@@ -81,6 +82,14 @@ def correction_findings(store) -> list[dict]:
                 error="The local archive copy of this source document is missing.",
                 source="Local source archive check",
             )
+
+    for integrity in store.ingestion_integrity():
+        document = documents.get(integrity["document_id"])
+        append(
+            category="ingestion_integrity", person_id=None, document=document,
+            error="This staged record is missing: " + ", ".join(integrity["missing"]) + ".",
+            source="Canonical intake-path integrity check",
+        )
 
     for status in store.housing_schedule_status():
         if status["status"] != "missing":

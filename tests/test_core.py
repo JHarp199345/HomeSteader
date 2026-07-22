@@ -195,6 +195,30 @@ class LeaseLinkingTests(unittest.TestCase):
         self.assertEqual(result["destination"], "form_bank")
         self.assertEqual(self.store.data["entities"][0]["kind"], "form_template")
 
+    def test_explicit_form_bank_ingestion_preserves_the_source_and_catalogs_the_form(self):
+        result = self.store.ingest_form_template(ROOT / "fixtures/blank_consent_to_share_information.txt")
+
+        self.assertEqual(result["status"], "filed")
+        self.assertEqual(result["destination"], "form_bank")
+        document = next(item for item in self.store.data["documents"] if item["id"] == result["document_id"])
+        self.assertTrue((self.store.path.parent / document["stored_source_path"]).is_file())
+        self.assertFalse(self.store.ingestion_integrity())
+        self.assertEqual(len(self.store.form_bank_families()), 1)
+
+    def test_ingestion_integrity_flags_records_written_without_the_canonical_path(self):
+        self.store.data["documents"].append({
+            "id": "unsafe-direct-write", "original_name": "not-ingested.pdf",
+            "extracted": {"document_type": "unknown"},
+        })
+
+        findings = self.store.ingestion_integrity()
+
+        self.assertEqual(findings[0]["document_id"], "unsafe-direct-write")
+        self.assertEqual(
+            findings[0]["missing"],
+            ["content hash", "preserved source", "ingestion timestamp", "intake occurrence"],
+        )
+
     def test_exact_duplicate_is_not_stored_twice(self):
         source = ROOT / "fixtures/blank_consent_to_share_information.txt"
         self.store.ingest(source)

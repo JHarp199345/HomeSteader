@@ -1395,6 +1395,43 @@ class HomesteaderStore:
                 return prior, improvements
         return None
 
+    def ingest_form_template(self, source: Path, *, original_name: str | None = None) -> dict:
+        """Preserve a user-selected blank form through the canonical local path."""
+        result = self.ingest(source, original_name=original_name, form_bank=True)
+        if result.get("document_id"):
+            self.ensure_form_thumbnail(result["document_id"])
+        return result
+
+    def ingestion_integrity(self) -> list[dict]:
+        """Report staged records that lack the preserved-source intake trail.
+
+        A tool with filesystem access can always edit a local JSON file, so the
+        safety boundary is detection rather than pretending that is impossible.
+        A record is not valid staged evidence unless its archive, hash,
+        timestamp, and intake occurrence are all present.
+        """
+        occurrence_hashes = {item.get("sha256") for item in self.data["intake_occurrences"]}
+        findings = []
+        for document in self.data["documents"]:
+            missing = []
+            if not document.get("sha256"):
+                missing.append("content hash")
+            if not document.get("stored_source_path"):
+                missing.append("preserved source")
+            elif not (self.path.parent / document["stored_source_path"]).is_file():
+                missing.append("available preserved source")
+            if not document.get("ingested_at"):
+                missing.append("ingestion timestamp")
+            if document.get("sha256") not in occurrence_hashes:
+                missing.append("intake occurrence")
+            if missing:
+                findings.append({
+                    "document_id": document.get("id"),
+                    "document": document.get("original_name", "Unnamed document"),
+                    "missing": missing,
+                })
+        return findings
+
     def ingest(self, source: Path, *, packet_id: str | None = None, original_name: str | None = None, form_bank: bool = False) -> dict:
         text, extraction_issue, extraction_method = self._extract_source_text(source)
         extracted = extract_document(text)

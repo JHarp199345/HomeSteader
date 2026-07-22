@@ -42,6 +42,20 @@ class CorrectionAuditTests(unittest.TestCase):
             self.assertEqual(review["source"], "Homesteader review queue")
             self.assertTrue(review["recommendation"])
 
+    def test_correction_report_surfaces_records_that_bypassed_ingestion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            store.data["documents"].append({
+                "id": "unsafe-direct-write", "original_name": "not-ingested.pdf",
+                "extracted": {"document_type": "unknown"},
+            })
+
+            finding = next(row for row in store.correction_findings() if row["category"] == "Ingestion Integrity")
+
+            self.assertEqual(finding["document"], "not-ingested.pdf")
+            self.assertIn("preserved source", finding["error"])
+            self.assertIn("Re-ingest", finding["recommendation"])
+
     def test_tls_schedule_flags_missing_quarter_but_not_due_diligence(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -163,6 +177,32 @@ Enrollment date: 2026-01-10
             store.close_intake_packet(packet["id"])
             statuses = store.housing_schedule_status(as_of=date(2026, 4, 11))
             self.assertTrue(any(item["requirement_key"] == "quarterly_income_verification" and item["status"] == "missing" for item in statuses))
+
+    def test_queued_intake_path_creates_a_schedule_only_from_qualified_enrollment_evidence(self):
+        """Exercise the same packet/job route used by the local watch folder."""
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            store = HomesteaderStore(folder / "state.json")
+            source = folder / "enrollment.txt"
+            source.write_text("""PROGRAM ENROLLMENT
+Participant: Jordan Atlas
+HMIS number: H-TRAIN-0001
+Program: TLS Adult SPA 2
+Enrollment date: 2026-01-15
+""")
+            packet = store.start_intake_packet("Queued enrollment")
+            queued = store.queue_intake_sources(packet["id"], [source])
+            self.assertEqual(len(queued), 1)
+            job = store.claim_next_intake_job()
+            result = store.add_to_intake_packet(job["packet_id"], [Path(job["source_path"])])
+            store.finish_intake_job(job["id"], result={"intake": result})
+            store.close_intake_packet(packet["id"])
+
+            statuses = store.housing_schedule_status(as_of=date(2026, 3, 11))
+
+            self.assertTrue(statuses)
+            self.assertTrue(any(item["requirement_key"] == "monthly_cfa" for item in statuses))
+            self.assertFalse(store.ingestion_integrity())
 
     def test_tls_scheduler_uses_monthly_cfa_calendar_quarters_and_annual_intake_month(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -130,7 +130,6 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
           .bar-btn { background: var(--cream-bright) !important; color: #123c3b !important; border: 2px solid rgba(28,29,31,.9); border-radius: 8px; }
           .bar-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; text-transform: uppercase; letter-spacing: .06em; font-size: .74rem; }
           .q-btn.bar-btn .q-btn__content, .q-btn.bar-btn .q-icon { color: #123c3b !important; }
-          .form-bank-upload { display: none !important; }
           .form-thumbnail { width: 124px; height: 166px; flex: 0 0 124px; background: white; border: 2px solid var(--ink); border-radius: 7px; overflow: hidden; }
           .form-thumbnail object, .form-thumbnail iframe, .form-thumbnail img { width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
 
@@ -945,15 +944,14 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
         def receive_form_bank_upload(event) -> None:
             """Archive a human-designated reusable blank form without filing it."""
-            inbox_path.mkdir(parents=True, exist_ok=True)
-            destination = inbox_path / f"form-bank-{uuid4()}-{Path(event.name).name}"
-            destination.write_bytes(event.content.read())
             try:
-                result = store.ingest(destination, form_bank=True)
-                if result.get("document_id"):
-                    store.ensure_form_thumbnail(result["document_id"])
+                inbox_path.mkdir(parents=True, exist_ok=True)
+                filename = Path(event.name).name
+                destination = inbox_path / f"form-bank-{uuid4()}-{filename}"
+                destination.write_bytes(event.content.read())
+                result = store.ingest_form_template(destination, original_name=filename)
                 store.save()
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, AttributeError) as error:
                 ui.notify(f"Form could not be added: {error}", type="negative")
                 return
             action = result.get("template_action") or result.get("action")
@@ -964,6 +962,29 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             }
             ui.notify(messages.get(action, "Blank form preserved in the local Form Bank."), type="positive")
             refresh_workspace()
+
+        def open_form_bank_upload_dialog() -> None:
+            """Use a visible chooser rather than a hidden UI component."""
+            with ui.dialog() as dialog, ui.card().classes("w-[32rem] max-w-full p-5"):
+                with ui.row().classes("w-full items-center justify-between mb-2"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("upload_file", size="24px").classes("text-teal-700")
+                        ui.label("Add blank form").classes("text-xl font-semibold")
+                    ui.button(icon="close", on_click=dialog.close).props("flat round dense")
+                ui.label("Choose a reusable blank form. Homesteader will preserve it locally, deduplicate exact copies, and keep it out of participant files.").classes("text-sm muted mb-3")
+
+                def receive_and_close(event) -> None:
+                    receive_form_bank_upload(event)
+                    dialog.close()
+
+                ui.upload(
+                    label="Choose blank form",
+                    multiple=True,
+                    auto_upload=True,
+                    on_upload=receive_and_close,
+                    on_rejected=lambda: ui.notify("That file type is not supported for the local Form Bank.", type="warning"),
+                ).props('accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff" flat color=teal text-color=teal-10').classes("retro-secondary w-full")
+            dialog.open()
 
         def set_current_form_template(form_id: str, document_id: str) -> None:
             try:
@@ -981,11 +1002,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 with ui.row().classes("panel-bar bar-teal"):
                     ui.label("Form Bank").classes("bar-title")
                     with ui.row().classes("items-center gap-2"):
-                        upload = ui.upload(multiple=True, auto_upload=True).props(
-                            'accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff"'
-                        ).classes("form-bank-upload")
-                        upload.on_upload(receive_form_bank_upload)
-                        ui.button(icon="upload", on_click=lambda: upload.run_method("pickFiles")).props(
+                        ui.button(icon="upload", on_click=open_form_bank_upload_dialog).props(
                             "round dense"
                         ).classes("bar-btn").tooltip("Add blank form")
                         ui.button("Packet definitions", icon="rule", on_click=open_packet_definition_editor).props(
