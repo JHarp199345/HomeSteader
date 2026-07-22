@@ -569,33 +569,55 @@ class HomesteaderStore:
             if alias["entity_id"] == entity_id:
                 searchable_names.add(alias["normalized"])
                 alias_names.append(alias["alias"])
-        documents = []
+        documents_by_id: dict[str, dict] = {}
+        support_ids = {entity_id, *nearby}
         for document in self.data["documents"]:
             # Evidence links are written when a document is processed.  They
             # are the primary source here: a network must show the records
             # that actually established it, even where an OCR extractor did
             # not preserve a tidy field/value pair.
-            if entity_id in document.get("evidence_entity_ids", []):
-                documents.append({
+            evidence_ids = set(document.get("evidence_entity_ids", []))
+            if entity_id in evidence_ids:
+                documents_by_id[document["id"]] = {
                     "document_id": document["id"], "name": document["original_name"],
                     "type": document.get("extracted", {}).get("document_type", "unknown"),
                     "document_date": document.get("extracted", {}).get("document_date"),
-                })
+                    "evidence_scope": "direct",
+                }
+                continue
+            # A relationship graph should also surface the stored records of
+            # its immediate connected entities. This does not claim that a
+            # quarterly form names a landlord; it clearly marks the document
+            # as support reached through the recorded relationship.
+            supporting_matches = evidence_ids & support_ids
+            if supporting_matches:
+                via = sorted({
+                    entities[match]["name"] for match in supporting_matches
+                    if match != entity_id and match in entities
+                }, key=str.casefold)
+                documents_by_id[document["id"]] = {
+                    "document_id": document["id"], "name": document["original_name"],
+                    "type": document.get("extracted", {}).get("document_type", "unknown"),
+                    "document_date": document.get("extracted", {}).get("document_date"),
+                    "evidence_scope": "related",
+                    "via": via,
+                }
                 continue
             extracted = document.get("extracted") or {}
             stated = [extracted.get("landlord"), extracted.get("property_address"), extracted.get("participant"), extracted.get("tenant")]
             if any(value and normalized_entity_name(value) in searchable_names for value in stated):
-                documents.append({
+                documents_by_id[document["id"]] = {
                     "document_id": document["id"], "name": document["original_name"],
                     "type": extracted.get("document_type", "unknown"),
                     "document_date": extracted.get("document_date"),
-                })
+                    "evidence_scope": "direct",
+                }
         return {
             "entity_id": entity_id, "name": entity["name"], "kind": entity["kind"],
             "attributes": entity.get("attributes") or {},
             "aliases": sorted(alias_names, key=str.casefold),
             "connected": connected,
-            "documents": sorted(documents, key=lambda item: item["name"].casefold()),
+            "documents": sorted(documents_by_id.values(), key=lambda item: (item["evidence_scope"] != "direct", item["name"].casefold())),
         }
 
     def universal_search(self, query: str) -> dict:
@@ -1210,7 +1232,15 @@ class HomesteaderStore:
                 if entity["kind"] not in {"landlord", "property", "unit", "program"}:
                     continue
                 canonical = normalized_entity_name(entity["name"])
-                if canonical and canonical in source_name and entity["id"] not in document.get("evidence_entity_ids", []):
+                # Some older imports stored a property and unit as one entity
+                # even though the source prints them in separate fields. The
+                # address portion is still direct evidence for that property;
+                # it is not a fuzzy name match.
+                address_only = canonical.split(" unit ", 1)[0].rstrip(", ")
+                directly_named = canonical in source_name or (
+                    entity["kind"] == "property" and len(address_only) > 6 and address_only in source_name
+                )
+                if directly_named and entity["id"] not in document.get("evidence_entity_ids", []):
                     document.setdefault("evidence_entity_ids", []).append(entity["id"])
 
             added += len(set(document.get("evidence_entity_ids", [])) - before)

@@ -308,6 +308,28 @@ class LeaseLinkingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.entity_network("missing-entity-id")
 
+    def test_entity_network_surfaces_evidence_through_a_recorded_relationship(self):
+        """A network cannot hide stored evidence merely because it sits on a connected participant."""
+        participant = self.store.create_temporary_file("Devin Cross")
+        landlord = self.store._new_entity("landlord", "Example Terrace Housing LLC")
+        property_entity = self.store._new_entity("property", "220 Example Terrace, Unit 7B")
+        self.store.data["documents"].append({
+            "id": "move-in-proof", "original_name": "devin-move-in.pdf",
+            "extracted": {"document_type": "move_in_assistance_request"},
+        })
+        self.store._event("housing_document_recorded", participant["participant_ledger_id"], {
+            "document_id": "move-in-proof", "participant_id": participant["person_id"],
+        })
+        self.store._relationship("leases_from", participant["person_id"], landlord["id"], "test")
+        self.store._relationship("owns_property", landlord["id"], property_entity["id"], "test")
+
+        landlord_network = self.store.entity_network(landlord["id"])
+        property_network = self.store.entity_network(property_entity["id"])
+
+        self.assertEqual(landlord_network["documents"][0]["document_id"], "move-in-proof")
+        self.assertEqual(landlord_network["documents"][0]["evidence_scope"], "related")
+        self.assertEqual(property_network["documents"][0]["document_id"], "move-in-proof")
+
 
 if __name__ == "__main__":
     unittest.main()

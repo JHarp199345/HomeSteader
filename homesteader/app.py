@@ -1556,15 +1556,20 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                         ui.button(icon="folder_open", on_click=lambda person_id=item["entity_id"]: open_participant_file(person_id)).props("flat dense round").tooltip("Open participant file")
                                     else:
                                         ui.button(icon="hub", on_click=lambda linked_id=item["entity_id"]: open_entity_profile(linked_id)).props("flat dense round").tooltip("Open profile")
-                ui.label("Documents naming this record").classes("font-medium mt-3")
+                ui.label("Stored evidence for this record").classes("font-medium mt-3")
                 if not network["documents"]:
-                    ui.label("No stored document states this name directly; connections above may come from related records.").classes("text-sm muted")
+                    ui.label("No preserved document is linked to this record or its recorded network yet.").classes("text-sm muted")
                 for document in network["documents"]:
                     detail = document["type"].replace("_", " ")
                     if document.get("document_date"):
                         detail += f" · {document['document_date']}"
                     with ui.row().classes("items-center gap-1 flex-nowrap"):
                         ui.label(f"{document['name']} ({detail})").classes("text-sm min-w-0")
+                        if document.get("evidence_scope") == "related":
+                            via = ", ".join(document.get("via", [])[:2]) or "a connected record"
+                            ui.label(f"via {via}").classes("text-xs muted")
+                        else:
+                            ui.label("direct evidence").classes("text-xs text-teal-800")
                         ui.button(icon="visibility", on_click=lambda document_id=document["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
             dialog.open()
 
