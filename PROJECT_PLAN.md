@@ -298,7 +298,12 @@ Create an intentionally unclear document: missing unit number, vague agreement r
 
 - Harden local-model support.
 - Add optional cloud/provider adapters with transparent permissions.
-- Add user-approved email, calendar, notification, and vendor-outreach connectors.
+- Implemented: a local schedule calendar projects derived obligations at year,
+  month, week, and day levels and exports a selected one-way `.ics` copy. It
+  has no calendar account connection, API credential, or source-record export.
+- Consider only separately approved email, calendar, notification, and
+  vendor-outreach connectors after their permissions and disclosure boundaries
+  are explicit.
 
 ### Phase 5 — Sync, security, and extensibility
 

@@ -172,7 +172,7 @@ The command-line export remains available for automation or troubleshooting.
 
 ## Housing Services schedules
 
-Housing Services is now the first active domain module. A recorded TLS enrollment starts a **standard 24-month timeline**. The prototype currently includes the one confirmed recurring rule represented by its fictional TLS fixtures: an initial and then quarterly income eligibility/verification record. It can report whether each expected quarter is documented or missing and includes missing periods in the local correction report.
+Housing Services is now the first active domain module. A recorded TLS enrollment starts a **standard 24-month timeline**. The current local TLS schedule includes monthly CFA requests due in the first ten days, quarterly income eligibility/verification in March, June, September, and December, and annual recertification in the enrollment month. It can report whether each expected record is documented, upcoming, due, or missing and includes missing periods in the local correction report.
 
 For an existing caseload brought into Homesteader mid-program, a quarterly checkpoint can establish the participant/program network and carry a stated enrollment date without triggering a retroactive missing-document list. Its ingestion creates a **historical baseline**; only scheduled obligations after that baseline are audited. This lets the system begin with the paperwork actually available today rather than demanding a complete historical import.
 
@@ -206,3 +206,13 @@ To inspect the derived schedule locally:
 ```bash
 .venv/bin/python -m homesteader.cli --state data/homesteader.json housing-schedule
 ```
+
+### Local calendar copy
+
+The **Schedule** view projects the locally derived obligations into a year,
+month, week, or day view. It is not a Google Calendar connection. **Export
+calendar copy** writes only the selected due/upcoming events to an importable
+`.ics` file; it does not include source documents, relationship data, or a
+database connection. An authorized user can manually import that copy into a
+permitted Google Calendar. Homesteader never signs in to Google, calls a
+calendar API, or exposes an internet endpoint for this feature.

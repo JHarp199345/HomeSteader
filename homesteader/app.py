@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import datetime
+import calendar as calendar_module
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 import socket
@@ -16,6 +17,7 @@ from nicegui import app, background_tasks, ui
 
 from homesteader.audit import filter_correction_findings
 from homesteader.correction_export import export_correction_report
+from homesteader.calendar_projection import EXPORTABLE_STATUSES, export_ics, schedule_calendar_events
 from homesteader.core import HomesteaderStore, SUPPORTED_INTAKE_SUFFIXES, browse_kind_from_query
 from homesteader.inbox import inspect_inbox
 
@@ -156,6 +158,20 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
           /* Dialogs on cream card stock */
           .q-dialog .q-card { background: var(--cream); border: 2px solid var(--ink); border-radius: 14px; box-shadow: 7px 7px 0 rgba(28,29,31,.6); }
+
+          /* Local schedule calendar */
+          .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border-top: 2px solid var(--ink); border-left: 2px solid var(--ink); }
+          .calendar-weekday { background: var(--teal); color: var(--cream-bright); border-right: 2px solid var(--ink); border-bottom: 2px solid var(--ink); padding: 6px; font-family: "Homesteader Display", sans-serif; font-weight: 600; letter-spacing: .06em; text-align: center; text-transform: uppercase; font-size: .72rem; }
+          .calendar-day { min-height: 116px; border-right: 2px solid var(--ink); border-bottom: 2px solid var(--ink); background: var(--cream-bright); padding: 6px; overflow: hidden; }
+          .calendar-day-muted { background: #e9dfc8; color: #766f60; }
+          .calendar-day-number { font-family: "Homesteader Display", sans-serif; font-weight: 700; font-size: 1rem; }
+          .calendar-event { border: 1px solid var(--ink); border-radius: 5px; padding: 3px 5px; margin-top: 4px; font-size: .68rem; line-height: 1.15; cursor: pointer; overflow: hidden; }
+          .calendar-event-documented { background: #d6eee5; }
+          .calendar-event-upcoming { background: #d8eceb; }
+          .calendar-event-due { background: #ffe3a9; }
+          .calendar-event-missing { background: #ffd2ca; }
+          .calendar-month-card { min-height: 126px; background: var(--cream-bright); border: 2px solid var(--ink); border-radius: 8px; padding: 9px; box-shadow: 3px 3px 0 rgba(28,29,31,.45); cursor: pointer; }
+          .calendar-month-card:hover { background: var(--manila); }
         </style>
     """)
 
@@ -173,7 +189,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         for key, label, icon in [
             ("overview", "Dashboard", "home"), ("review", "Errors & Review", "warning"),
             ("reports", "Correction Reports", "summarize"), ("files", "File Index", "folder_open"),
-            ("packets", "Packets & Intake", "inventory_2"),
+            ("packets", "Packets & Intake", "inventory_2"), ("calendar", "Schedule", "calendar_month"),
         ]:
             nav_buttons[key] = ui.button(label, icon=icon, on_click=lambda key=key: set_active_view(key)).props("flat no-caps").classes("w-full mb-1")
         ui.separator().classes("my-3 opacity-30")
@@ -210,7 +226,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             for key, label, icon in [
                 ("review", "Needs Review", "warning"), ("reports", "Correction Findings", "summarize"),
                 ("files", "File Index", "folder_open"), ("packets", "Packets & Intake", "inventory_2"),
-                ("forms", "Form Bank", "article"), ("queue", "Local Queue", "sync"),
+                ("calendar", "Schedule", "calendar_month"), ("forms", "Form Bank", "article"), ("queue", "Local Queue", "sync"),
             ]:
                 with ui.element("div").classes("folder-tab") as tab:
                     ui.icon(icon, size="16px")
@@ -233,6 +249,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 review_panel = ui.column().classes("panel w-full gap-3")
                 correction_panel = ui.column().classes("panel w-full gap-3")
                 detached_panel = ui.column().classes("panel w-full gap-3")
+                calendar_panel = ui.column().classes("panel w-full gap-3")
                 form_bank_panel = ui.column().classes("panel w-full gap-3")
                 participant_panel = ui.column().classes("panel w-full gap-3")
             with ui.column().classes("w-[22rem] shrink-0 gap-5") as right_rail:
@@ -260,6 +277,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
         watched_file_signatures: dict[str, tuple[int, int]] = {}
         participant_filters = {"query": "", "status": "all", "program": None, "has_lease": False, "date_from": None, "date_to": None}
         correction_filters = {"query": "", "caseworker": None, "program": None, "category": None, "date_from": None, "date_to": None}
+        calendar_state = {"mode": "month", "anchor": date.today(), "include_documented": True}
 
         def metrics_values() -> list[tuple[str, int, str, str, bool]]:
             pending = len(store.pending_reviews())
@@ -854,6 +872,140 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                             ui.label(f"{row['document_count']} document(s) · {row['lease_count']} lease(s) · {programs}").classes("text-sm muted")
                         ui.button("Open file", icon="folder_open", on_click=lambda person_id=row["person_id"]: open_participant_file(person_id)).props("flat no-caps")
 
+        def _calendar_window() -> tuple[date, date, str]:
+            anchor = calendar_state["anchor"]
+            mode = calendar_state["mode"]
+            if mode == "year":
+                return date(anchor.year, 1, 1), date(anchor.year + 1, 1, 1), str(anchor.year)
+            if mode == "month":
+                start = date(anchor.year, anchor.month, 1)
+                end = date(anchor.year + (anchor.month == 12), 1 if anchor.month == 12 else anchor.month + 1, 1)
+                return start, end, start.strftime("%B %Y")
+            if mode == "week":
+                start = anchor - timedelta(days=anchor.weekday())
+                return start, start + timedelta(days=7), f"Week of {start.strftime('%B')} {start.day}, {start.year}"
+            return anchor, anchor + timedelta(days=1), anchor.strftime("%A, %B %-d, %Y")
+
+        def _shift_calendar(direction: int) -> None:
+            anchor = calendar_state["anchor"]
+            mode = calendar_state["mode"]
+            if mode == "year":
+                calendar_state["anchor"] = date(anchor.year + direction, anchor.month, min(anchor.day, 28))
+            elif mode == "month":
+                month = anchor.month + direction
+                year = anchor.year + (month - 1) // 12
+                month = (month - 1) % 12 + 1
+                calendar_state["anchor"] = date(year, month, 1)
+            elif mode == "week":
+                calendar_state["anchor"] = anchor + timedelta(days=7 * direction)
+            else:
+                calendar_state["anchor"] = anchor + timedelta(days=direction)
+            refresh_calendar()
+
+        def _calendar_event_card(event: dict, *, compact: bool = False) -> None:
+            status = event["status"] or "upcoming"
+            title = event["title"] if not compact else event["title"].split(" — ")[-1]
+            card = ui.element("div").classes(f"calendar-event calendar-event-{status}")
+            with card:
+                ui.label(title).classes("font-medium")
+                if not compact:
+                    ui.label(event["detail"]).classes("text-[10px]")
+            if event.get("person_id"):
+                card.on("click", lambda person_id=event["person_id"]: open_participant_file(person_id))
+
+        def export_calendar_copy() -> None:
+            start, end, title = _calendar_window()
+            horizon = max(date.today(), end - timedelta(days=1))
+            rows = store.housing_schedule_status(as_of=date.today(), through=horizon)
+            events = [event for event in schedule_calendar_events(rows, include_documented=False) if event["status"] in EXPORTABLE_STATUSES and start <= event["start"] < end]
+            if not events:
+                ui.notify("There are no due or upcoming schedule events in this view to export.", type="warning")
+                return
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+            output = exports_dir / f"Homesteader_Schedule_Copy_{_safe_export_label(title)}_{timestamp}.ics"
+            export_ics(events, output)
+            ui.download(output, filename=output.name)
+            ui.notify(f"Created a local calendar copy with {len(events)} event(s). Import the .ics file in Google Calendar when you choose.", type="positive")
+
+        def _safe_export_label(value: str) -> str:
+            return "".join(character if character.isalnum() else "_" for character in value).strip("_")[:48] or "Schedule"
+
+        def refresh_calendar() -> None:
+            calendar_panel.clear()
+            start, end, title = _calendar_window()
+            horizon = max(date.today(), date(end.year, 12, 31))
+            rows = store.housing_schedule_status(as_of=date.today(), through=horizon)
+            events = schedule_calendar_events(rows, include_documented=calendar_state["include_documented"])
+            with calendar_panel:
+                with ui.row().classes("panel-bar bar-teal"):
+                    ui.label("Local schedule").classes("bar-title")
+                    ui.button("Export calendar copy", icon="event_available", on_click=export_calendar_copy).props("outline no-caps").classes("bar-btn")
+                ui.label("A local projection of program rules and recorded evidence. It never connects to Google Calendar or sends Homesteader data anywhere.").classes("text-sm muted")
+                ui.label("Export creates a selected .ics copy only; import that file into Google Calendar manually if your organization approves it. Source documents, relationships, and the Homesteader database are never included.").classes("text-sm muted")
+                with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
+                    with ui.row().classes("items-center gap-1"):
+                        ui.button(icon="chevron_left", on_click=lambda: _shift_calendar(-1)).props("flat round dense")
+                        ui.label(title).classes("view-heading text-xl")
+                        ui.button(icon="chevron_right", on_click=lambda: _shift_calendar(1)).props("flat round dense")
+                        ui.button("Today", on_click=lambda: (calendar_state.update({"anchor": date.today()}), refresh_calendar())).props("flat no-caps dense")
+                    mode = ui.toggle({"year": "Year", "month": "Month", "week": "Week", "day": "Day"}, value=calendar_state["mode"]).props("dense no-caps")
+                    def change_mode() -> None:
+                        calendar_state["mode"] = mode.value
+                        refresh_calendar()
+                    mode.on("update:model-value", change_mode)
+                documented = ui.checkbox("Show documented items", value=calendar_state["include_documented"])
+                documented.on("update:model-value", lambda: (calendar_state.update({"include_documented": documented.value}), refresh_calendar()))
+                visible = [event for event in events if event["start"] < end and event["end"] > start]
+                if calendar_state["mode"] == "year":
+                    with ui.row().classes("w-full gap-4 flex-wrap"):
+                        for month in range(1, 13):
+                            month_start = date(start.year, month, 1)
+                            month_end = date(start.year + (month == 12), 1 if month == 12 else month + 1, 1)
+                            month_events = [event for event in events if event["start"] < month_end and event["end"] > month_start]
+                            with ui.element("div").classes("calendar-month-card w-[13rem]") as month_card:
+                                ui.label(month_start.strftime("%B")).classes("view-heading text-lg")
+                                ui.label(f"{len(month_events)} scheduled item{'s' if len(month_events) != 1 else ''}").classes("text-xs muted")
+                                for event in month_events[:3]:
+                                    _calendar_event_card(event, compact=True)
+                                if len(month_events) > 3:
+                                    ui.label(f"+ {len(month_events) - 3} more").classes("text-xs muted")
+                            month_card.on("click", lambda month=month: (calendar_state.update({"mode": "month", "anchor": date(start.year, month, 1)}), refresh_calendar()))
+                elif calendar_state["mode"] == "month":
+                    with ui.element("div").classes("calendar-grid w-full"):
+                        for weekday in calendar_module.day_abbr:
+                            ui.label(weekday).classes("calendar-weekday")
+                        first_weekday, days = calendar_module.monthrange(start.year, start.month)
+                        previous_month_end = start - timedelta(days=1)
+                        for offset in range(first_weekday):
+                            day = previous_month_end - timedelta(days=first_weekday - offset - 1)
+                            with ui.element("div").classes("calendar-day calendar-day-muted"):
+                                ui.label(str(day.day)).classes("calendar-day-number")
+                        for day_number in range(1, days + 1):
+                            day = date(start.year, start.month, day_number)
+                            day_events = [event for event in events if event["start"] <= day < event["end"]]
+                            with ui.element("div").classes("calendar-day"):
+                                ui.label(str(day_number)).classes("calendar-day-number")
+                                for event in day_events[:3]:
+                                    _calendar_event_card(event, compact=True)
+                                if len(day_events) > 3:
+                                    ui.label(f"+ {len(day_events) - 3} more").classes("text-xs muted")
+                        total = first_weekday + days
+                        for day_number in range(1, (7 - total % 7) % 7 + 1):
+                            with ui.element("div").classes("calendar-day calendar-day-muted"):
+                                ui.label(str(day_number)).classes("calendar-day-number")
+                else:
+                    days = [start + timedelta(days=offset) for offset in range((end - start).days)]
+                    with ui.row().classes("w-full gap-3 flex-wrap"):
+                        for day in days:
+                            day_events = [event for event in events if event["start"] <= day < event["end"]]
+                            with ui.column().classes("calendar-month-card flex-grow min-w-[12rem] gap-2"):
+                                ui.label(day.strftime("%a, %b %-d")).classes("view-heading text-lg")
+                                if not day_events:
+                                    ui.label("No scheduled items").classes("text-xs muted")
+                                for event in day_events:
+                                    _calendar_event_card(event)
+                ui.label(f"{len(visible)} schedule item{'s' if len(visible) != 1 else ''} in this view. Open any item to inspect the participant file and its preserved evidence.").classes("text-sm muted mt-2")
+
         def open_participant_filters() -> None:
             program_names = sorted(entity["name"] for entity in store.data["entities"] if entity["kind"] == "program")
             with ui.dialog() as dialog, ui.card().classes("w-96"):
@@ -1265,6 +1417,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 "reports": ("DATA QUALITY", "Correction Reports", "Exportable, evidence-backed correction work."),
                 "files": ("RECORDS", "File Index", "Browse participant records; use universal search to navigate the whole relationship network."),
                 "packets": ("INTAKE", "Packets & Intake", "Bring unsorted records into a coherent local packet."),
+                "calendar": ("SCHEDULE", "Local Schedule", "Zoom through locally derived program obligations before exporting a separate calendar copy."),
                 "forms": ("DATA", "Form Bank", "Reusable blank forms, kept separate from participant files."),
                 "queue": ("SYSTEM", "Local Queue", "Private, on-device processing status."),
             }
@@ -1281,6 +1434,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             quick_actions_panel.visible = key == "overview"
             packet_panel.visible = key == "packets"
             detached_panel.visible = key == "packets"
+            calendar_panel.visible = key == "calendar"
             form_bank_panel.visible = key == "forms"
             participant_panel.visible = key == "files"
             relationship_panel.visible = True
@@ -1306,6 +1460,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             refresh_relationship_search()
             refresh_form_bank()
             refresh_participant_index()
+            refresh_calendar()
             refresh_activity()
             apply_active_view()
 

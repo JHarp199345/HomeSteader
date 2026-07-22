@@ -643,7 +643,7 @@ class HomesteaderStore:
             "documents": sorted(document_matches, key=lambda item: item["name"].casefold()),
         }
 
-    def housing_schedule_status(self, *, as_of: date | None = None) -> list[dict]:
+    def housing_schedule_status(self, *, as_of: date | None = None, through: date | None = None) -> list[dict]:
         """Derive standard program obligations without changing any file.
 
         Only a recorded enrollment starts a schedule.  Extensions, transfers,
@@ -651,6 +651,7 @@ class HomesteaderStore:
         ledger events before they alter the standard timeline.
         """
         today = as_of or date.today()
+        horizon = through or today
         documents = {document["id"]: document for document in self.data["documents"]}
         people = {entity["id"]: entity for entity in self.data["entities"] if entity["kind"] == "person"}
         statuses = []
@@ -693,12 +694,12 @@ class HomesteaderStore:
                 if event.get("details", {}).get("participant_id") == person["id"]
             ]
             for requirement in schedule.scheduled_requirements:
-                for occurrence in scheduled_occurrences(requirement, start, end, today):
+                for occurrence in scheduled_occurrences(requirement, start, end, horizon):
                     period_start, period_end, due = occurrence["period_start"], occurrence["period_end"], occurrence["due_date"]
                     # Homesteader begins with whatever real-world checkpoint
                     # it first receives. Historical requirements before that
                     # baseline are not silently converted into accusations.
-                    if period_start < baseline or period_start > today or (exit_date and period_start >= exit_date):
+                    if period_start < baseline or (exit_date and period_start >= exit_date):
                         continue
                     evidence = []
                     for event in participant_events:

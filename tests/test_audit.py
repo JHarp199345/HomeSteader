@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 
 from homesteader.audit import filter_correction_findings
+from homesteader.calendar_projection import export_ics, schedule_calendar_events
 from homesteader.core import HomesteaderStore
 
 
@@ -202,6 +203,27 @@ Reporting period: Quarterly recertification - March 2026
             self.assertEqual(march_cfa_status["due_date"], "2026-03-10")
             self.assertEqual(march_quarterly_status["status"], "documented")
             self.assertEqual(annual["status"], "due")
+            projected = store.housing_schedule_status(as_of=date(2026, 3, 11), through=date(2026, 4, 30))
+            april_cfa = next(item for item in projected if item["requirement_key"] == "monthly_cfa" and item["period_start"] == "2026-04-01")
+            self.assertEqual(april_cfa["status"], "upcoming")
+
+    def test_schedule_calendar_projection_uses_month_or_day_precision_and_exports_ics(self):
+        rows = [
+            {"person_id": "person-1", "ptc": "Jasmine Morales", "participant_identifier": "H-000042", "program": "TLS", "requirement_key": "monthly_cfa", "requirement": "client financial assistance request (CFA)", "period_start": "2026-03-01", "period_end": "2026-04-01", "due_date": "2026-03-10", "due_precision": "day", "status": "due"},
+            {"person_id": "person-1", "ptc": "Jasmine Morales", "participant_identifier": "H-000042", "program": "TLS", "requirement_key": "quarterly_income_verification", "requirement": "quarterly income eligibility / verification", "period_start": "2026-03-01", "period_end": "2026-04-01", "due_date": "2026-03-01", "due_precision": "month", "status": "upcoming"},
+        ]
+        events = schedule_calendar_events(rows)
+        self.assertEqual(events[0]["start"], date(2026, 3, 1))
+        self.assertEqual(events[0]["end"], date(2026, 4, 1))
+        cfa = next(event for event in events if "assistance" in event["title"].casefold())
+        self.assertEqual(cfa["start"], date(2026, 3, 10))
+        self.assertEqual(cfa["end"], date(2026, 3, 11))
+        with tempfile.TemporaryDirectory() as directory:
+            output = export_ics(events, Path(directory) / "Homesteader_Schedule.ics")
+            content = output.read_text()
+            self.assertIn("BEGIN:VCALENDAR", content)
+            self.assertIn("DTSTART;VALUE=DATE:20260310", content)
+            self.assertIn("DTEND;VALUE=DATE:20260401", content)
 
     def test_program_rules_can_be_loaded_from_a_local_file(self):
         with tempfile.TemporaryDirectory() as directory:
