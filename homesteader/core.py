@@ -930,7 +930,11 @@ class HomesteaderStore:
             ingested_raw = doc.get("ingested_at") or doc.get("created_at") or now()
             upload_date_str = ingested_raw[:10]
 
-            if doc_id in pending_review_doc_ids:
+            if (doc.get("staging_disposition") or {}).get("kind") == "non_viable":
+                status_code = "non_viable"
+                status_label = "Non-viable source"
+                status_color = "grey"
+            elif doc_id in pending_review_doc_ids:
                 status_code = "needs_review"
                 status_label = "Needs Review"
                 status_color = "warning"
@@ -1786,6 +1790,24 @@ class HomesteaderStore:
     def pending_reviews(self) -> list[dict]:
         return [item for item in self.data["review_queue"] if item["status"] == "needs_review"]
 
+    def review_suggestion(self, review: dict) -> dict:
+        """Describe the next safe staging action without changing the source.
+
+        A suggestion is deliberately not a verdict or an automatic filing
+        decision.  It helps a reviewer distinguish a usable-but-ambiguous
+        record from a blank or otherwise non-viable upload.
+        """
+        document = next((item for item in self.data["documents"] if item["id"] == review.get("document_id")), None)
+        if not document:
+            return {"kind": "source_missing", "label": "Source unavailable", "detail": "The archived source is unavailable; restore it before making a filing decision."}
+        extracted = document.get("extracted", {})
+        if extracted.get("document_type") == "form_template":
+            return {"kind": "form_template", "label": "Reusable blank form", "detail": "This appears to be a blank reusable form, not participant evidence. Store it in the Form Bank if that is correct."}
+        meaningful_fields = ("participant", "tenant", "hmis_id", "date_of_birth", "property_address", "unit", "landlord", "document_date", "signed_date")
+        if not any(extracted.get(field) for field in meaningful_fields):
+            return {"kind": "non_viable", "label": "Document is not viable for a participant file", "detail": "No usable identity, property, date, or completed-record evidence was extracted. Preserve the source locally, but exclude it from files, packet evidence, and export unless it is later reopened."}
+        return {"kind": "needs_review", "label": "Usable source needs a human decision", "detail": "The source contains potentially useful evidence, but the current association or required facts are not supported strongly enough to file automatically."}
+
     def resolve_review(self, review_id: str, action: str, *, entity_id: str | None = None, new_person_name: str | None = None, note: str | None = None, context_note: str | None = None) -> dict:
         item = next((review for review in self.data["review_queue"] if review["id"] == review_id), None)
         if not item:
@@ -1805,11 +1827,14 @@ class HomesteaderStore:
             resolution["entity_id"] = person["id"]
         elif action == "catalog_form":
             pass
+        elif action == "archive_non_viable":
+            if not note or not note.strip():
+                raise ValueError("archive_non_viable requires a brief reason so the source can be understood later.")
         elif action == "accept_revision":
             if not item.get("revision_of_document_id"):
                 raise ValueError("accept_revision is only available for a completed-revision proposal.")
         elif action != "leave_unassigned":
-            raise ValueError("Action must be assign_existing, create_person, catalog_form, accept_revision, or leave_unassigned.")
+            raise ValueError("Action must be assign_existing, create_person, catalog_form, archive_non_viable, accept_revision, or leave_unassigned.")
         item["status"] = "resolved"
         item["resolution"] = resolution
         item["resolved_at"] = now()
@@ -1828,6 +1853,17 @@ class HomesteaderStore:
             form_result = self._catalog_form(document)
             resolution["form_id"] = form_result["form_id"]
             item["resolution"] = resolution
+        if action == "archive_non_viable" and document:
+            disposition = {
+                "kind": "non_viable", "reason": note.strip(), "review_id": review_id,
+                "recorded_at": now(), "source": "human_review",
+            }
+            document["staging_disposition"] = disposition
+            document.setdefault("staging_disposition_history", []).append(disposition.copy())
+            self._event("staging_disposition_recorded", document["id"], {
+                "document_id": document["id"], "review_id": review_id,
+                "disposition": "non_viable", "reason": note.strip(), "source": "human_review",
+            })
         if action == "accept_revision" and document:
             prior_id = item["revision_of_document_id"]
             relationship = {
@@ -1872,6 +1908,31 @@ class HomesteaderStore:
                         "source": "human_review",
                     })
         return {"status": "resolved", "review_id": review_id, "resolution": resolution}
+
+    def reopen_non_viable_document(self, document_id: str, *, note: str | None = None) -> dict:
+        """Return a retained non-viable source to the human review queue.
+
+        The prior disposition remains in history; reopening never erases the
+        original scan, the earlier decision, or its reason.
+        """
+        document = next((item for item in self.data["documents"] if item["id"] == document_id), None)
+        if not document:
+            raise ValueError("Document does not exist.")
+        disposition = document.get("staging_disposition") or {}
+        if disposition.get("kind") != "non_viable":
+            raise ValueError("Only a non-viable source can be reopened.")
+        previous = disposition.copy()
+        document.pop("staging_disposition", None)
+        self._event("staging_disposition_reopened", document_id, {
+            "document_id": document_id, "previous_disposition": previous,
+            "note": note or "", "source": "human_review",
+        })
+        result = self._review(
+            document,
+            "A previously non-viable staging source was reopened; inspect the original before filing.",
+            reopened_from_disposition=previous,
+        )
+        return {"status": "needs_review", "review_id": result["review_id"], "document_id": document_id}
 
     def _link_context_note_entities(self, evidence: dict, context_note: str) -> None:
         """Link only exact, already-known entities explicitly named in context.

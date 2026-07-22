@@ -512,7 +512,11 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 with ui.row().classes("panel-bar bar-teal"):
                     ui.label("Detached Documents").classes("bar-title")
                 packet = selected_packet()
-                documents = [document for document in store.data["documents"] if not document.get("intake_packet_id")]
+                documents = [
+                    document for document in store.data["documents"]
+                    if not document.get("intake_packet_id")
+                    and (document.get("staging_disposition") or {}).get("kind") != "non_viable"
+                ]
                 if not documents:
                     ui.label("No detached documents.").classes("muted")
                 for document in documents[-10:]:
@@ -1190,96 +1194,129 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
         def open_review_dialog(review: dict) -> None:
             document = next((item for item in store.data["documents"] if item["id"] == review["document_id"]), None)
+            if not document:
+                ui.notify("The preserved document could not be found.", type="negative")
+                return
             proposed = review.get("proposed_person_id")
-            proposed_name = document["extracted"].get("participant") if document else ""
-            with ui.dialog() as dialog, ui.card().classes("w-[42rem] max-w-full"):
-                ui.label("Review document").classes("text-lg font-semibold")
-                ui.label(document["original_name"] if document else "Document").classes("text-sm muted")
-                ui.label(review["reason"]).classes("text-sm")
-                if review.get("revision_of_document_id"):
-                    original = next((item for item in store.data["documents"] if item["id"] == review["revision_of_document_id"]), None)
-                    ui.label(f"Possible completed revision of: {original['original_name'] if original else 'stored original'}").classes("text-sm text-teal-800")
-                    ui.label(f"New fields: {', '.join(review.get('revision_fields', []))}").classes("text-sm muted")
-                if document and document.get("source_text"):
-                    ui.textarea("Source text", value=document["source_text"][:3000]).props("readonly").classes("w-full")
-                ui.label("Find the participant file").classes("font-medium")
-                ui.label("Search by the name on this document. Open a match to inspect its existing evidence before filing.").classes("text-sm muted")
-                search = ui.input("Participant name", value=proposed_name or "").classes("w-full")
-                selected_person_id: str | None = proposed
-                selected_label = ui.label("No participant file selected.").classes("text-sm muted")
-                match_results = ui.column().classes("w-full gap-2")
-
-                def select_person(person_id: str) -> None:
-                    nonlocal selected_person_id
-                    summary = store.participant_file(person_id)
-                    selected_person_id = person_id
-                    identifier = summary["attributes"].get("hmis_id") or summary["attributes"].get("temporary_id") or "No identifier yet"
-                    selected_label.set_text(f"Selected: {summary['name']} — {identifier}")
-                    selected_label.classes(remove="muted")
-
-                def show_matches() -> None:
-                    match_results.clear()
-                    matches = store.search_files(search.value or "")
-                    with match_results:
-                        if not (search.value or "").strip():
-                            ui.label("Enter a name to search existing participant files.").classes("text-sm muted")
-                        elif not matches:
-                            ui.label("No existing participant file matches this name. You can create a provisional file below.").classes("text-sm muted")
-                        for match in matches:
-                            summary = store.participant_file(match["person_id"])
-                            identifier = match["hmis_id"] or match["temporary_id"] or "No identifier yet"
-                            with ui.card().classes("w-full border border-slate-200 shadow-none"):
-                                with ui.row().classes("w-full items-center justify-between"):
-                                    with ui.column().classes("gap-0"):
-                                        ui.label(f"{match['name']} — {match['status']}").classes("font-medium")
-                                        ui.label(f"{identifier} · {match['document_count']} linked document(s) · {summary['event_count']} recorded event(s)").classes("text-sm muted")
-                                    ui.button("Use this file", on_click=lambda person_id=match["person_id"]: select_person(person_id)).props("outline no-caps")
-                                if summary["documents"]:
-                                    ui.label("Existing evidence:").classes("text-sm font-medium mt-2")
-                                    for linked in summary["documents"][-5:]:
-                                        detail = linked["document_type"].replace("_", " ")
-                                        if linked.get("reporting_period"):
-                                            detail += f" · {linked['reporting_period']}"
-                                        elif linked.get("document_date"):
-                                            detail += f" · {linked['document_date']}"
-                                        with ui.row().classes("items-center gap-1"):
-                                            ui.label(f"• {linked['original_name']} ({detail})").classes("text-sm muted")
-                                            ui.button(icon="visibility", on_click=lambda document_id=linked["id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
-
-                ui.button("Search files", icon="search", on_click=show_matches).props("outline no-caps")
-                show_matches()
-                new_name = ui.input("Or create provisional client", value=proposed_name or "").classes("w-full")
-                context_note = ui.textarea("What is this connected to?", placeholder="Example: Water damage on the bedroom wall in Unit 1 at Harbor View, reported by Jasmine Morales today. You can type or use Mac dictation.").classes("w-full")
-                note = ui.textarea("Decision note").classes("w-full")
-
-                def resolve(action: str) -> None:
-                    try:
-                        if action == "assign_existing":
-                            store.resolve_review(review["id"], action, entity_id=selected_person_id, note=note.value or None, context_note=context_note.value or None)
-                        elif action == "create_person":
-                            store.resolve_review(review["id"], action, new_person_name=new_name.value or None, note=note.value or None, context_note=context_note.value or None)
-                        elif action == "catalog_form":
-                            store.resolve_review(review["id"], action, note=note.value or None, context_note=context_note.value or None)
+            proposed_name = document.get("extracted", {}).get("participant") or ""
+            suggestion = store.review_suggestion(review)
+            stored_path = document.get("stored_source_path")
+            source_url = f"/homesteader-source/{Path(stored_path).name}" if stored_path else None
+            with ui.dialog() as dialog, ui.card().classes("w-[90rem] max-w-full p-4"):
+                with ui.row().classes("w-full items-center justify-between border-b pb-2 mb-3"):
+                    with ui.column().classes("gap-0 min-w-0"):
+                        ui.label("Review document").classes("text-xl font-semibold")
+                        ui.label(document["original_name"]).classes("text-sm muted")
+                    ui.button(icon="close", on_click=dialog.close).props("flat round dense")
+                with ui.row().classes("w-full h-[38rem] gap-4 flex-nowrap items-stretch"):
+                    with ui.column().classes("w-2/3 h-full gap-2"):
+                        ui.label("PRESERVED ORIGINAL").classes("section-kicker")
+                        if source_url:
+                            ui.html(f'<iframe src="{source_url}" class="w-full h-full border-2 border-ink rounded-lg bg-white"></iframe>').classes("w-full h-full")
                         else:
-                            store.resolve_review(review["id"], action, note=note.value or None, context_note=context_note.value or None)
+                            ui.label("This older record has no archived source file. The available OCR text is shown in the evidence panel.").classes("text-sm text-amber-800")
+                    with ui.column().classes("w-1/3 h-full overflow-y-auto p-3 bg-cream-bright border-2 border-ink rounded-lg gap-3"):
+                        ui.label("REVIEW FINDING").classes("section-kicker")
+                        ui.label(review["category"].replace("_", " ").title()).classes("font-semibold text-sm text-secondary")
+                        ui.label(review["reason"]).classes("text-sm")
+                        ui.label("SUGGESTION").classes("section-kicker mt-2")
+                        ui.label(suggestion["label"]).classes("font-semibold text-sm")
+                        ui.label(suggestion["detail"]).classes("text-sm muted")
+                        if review.get("revision_of_document_id"):
+                            original = next((item for item in store.data["documents"] if item["id"] == review["revision_of_document_id"]), None)
+                            ui.label("POSSIBLE COMPLETED REVISION").classes("section-kicker mt-2")
+                            ui.label(original["original_name"] if original else "Stored original").classes("text-sm")
+                            ui.label("New fields: " + ", ".join(review.get("revision_fields", []))).classes("text-xs muted")
+                        ui.label("EXTRACTED METADATA").classes("section-kicker mt-2")
+                        metadata = {key: value for key, value in document.get("extracted", {}).items() if value}
+                        if metadata:
+                            for key, value in metadata.items():
+                                with ui.column().classes("gap-0 border-b border-ink/10 pb-1"):
+                                    ui.label(key.replace("_", " ").title()).classes("text-xs font-semibold text-teal-800")
+                                    ui.label(str(value)).classes("text-sm")
+                        else:
+                            ui.label("No usable metadata was extracted.").classes("text-sm muted")
+                        if document.get("context_annotations"):
+                            ui.label("USER CONTEXT").classes("section-kicker mt-2")
+                            for annotation in document["context_annotations"]:
+                                ui.label(annotation["text"]).classes("text-sm muted")
+                        ui.label("OCR TEXT").classes("section-kicker mt-2")
+                        ui.textarea(value=document.get("source_text", "")).props("readonly dense").classes("w-full text-xs")
+
+                ui.separator().classes("my-3")
+                note = None
+                context_note = None
+                if suggestion["kind"] == "non_viable":
+                    ui.label("Archive as a non-viable source").classes("font-medium")
+                    ui.label("This records the reason, keeps the original scan and review history, and removes it from normal filing, packet evidence, and export. You can reopen it later.").classes("text-sm muted")
+                    non_viable_reason = ui.input("Reason", value="Source is blank or lacks usable completed information.").classes("w-full")
+                    with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                        ui.button("Keep in review", on_click=dialog.close).props("flat no-caps")
+                        ui.button("Archive non-viable source", icon="archive", on_click=lambda: resolve("archive_non_viable", non_viable_reason.value)).props("no-caps").classes("retro-primary")
+                elif suggestion["kind"] == "form_template":
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Keep in review", on_click=dialog.close).props("flat no-caps")
+                        ui.button("Store in Form Bank", icon="inventory_2", on_click=lambda: resolve("catalog_form")).props("no-caps")
+                else:
+                    ui.label("Participant association").classes("font-medium")
+                    ui.label("Search by the name on the source. Open a match to inspect its existing evidence before filing.").classes("text-sm muted")
+                    search = ui.input("Participant name", value=proposed_name).classes("w-full")
+                    selected_person_id: str | None = proposed
+                    selected_label = ui.label("No participant file selected.").classes("text-sm muted")
+                    match_results = ui.column().classes("w-full gap-2")
+
+                    def select_person(person_id: str) -> None:
+                        nonlocal selected_person_id
+                        summary = store.participant_file(person_id)
+                        selected_person_id = person_id
+                        identifier = summary["attributes"].get("hmis_id") or summary["attributes"].get("temporary_id") or "No identifier yet"
+                        selected_label.set_text(f"Selected: {summary['name']} — {identifier}")
+                        selected_label.classes(remove="muted")
+
+                    def show_matches() -> None:
+                        match_results.clear()
+                        with match_results:
+                            for match in store.search_files(search.value or ""):
+                                identifier = match["hmis_id"] or match["temporary_id"] or "No identifier yet"
+                                with ui.row().classes("w-full items-center justify-between"):
+                                    ui.label(f"{match['name']} — {identifier} · {match['document_count']} linked document(s)").classes("text-sm")
+                                    ui.button("Use this file", on_click=lambda person_id=match["person_id"]: select_person(person_id)).props("outline no-caps dense")
+
+                    ui.button("Search participant files", icon="search", on_click=show_matches).props("outline no-caps")
+                    if proposed_name:
+                        show_matches()
+                    new_name = ui.input("Or create provisional client", value=proposed_name).classes("w-full")
+                    context_note = ui.textarea("What is this connected to?", placeholder="Optional context for a photo, message, or otherwise ambiguous record.").classes("w-full")
+                    note = ui.textarea("Decision note").classes("w-full")
+
+                    with ui.row().classes("w-full justify-between flex-wrap gap-2"):
+                        with ui.row().classes("gap-2"):
+                            ui.button("Leave unassigned", on_click=lambda: resolve("leave_unassigned")).props("flat no-caps")
+                            ui.button("Store in Form Bank", icon="inventory_2", on_click=lambda: resolve("catalog_form")).props("flat no-caps")
+                        with ui.row().classes("gap-2"):
+                            ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                            if review.get("revision_of_document_id"):
+                                ui.button("Confirm completed revision", icon="published_with_changes", on_click=lambda: resolve("accept_revision")).props("outline no-caps")
+                            ui.button("Create and file", icon="person_add", on_click=lambda: resolve("create_person")).props("outline no-caps")
+                            ui.button("File with client", icon="assignment_turned_in", on_click=lambda: resolve("assign_existing")).props("no-caps")
+
+                def resolve(action: str, override_note: str | None = None) -> None:
+                    try:
+                        note_value = override_note if override_note is not None else (note.value or None if note else None)
+                        context_value = (context_note.value or None) if context_note else None
+                        if action == "assign_existing":
+                            store.resolve_review(review["id"], action, entity_id=selected_person_id, note=note_value, context_note=context_value)
+                        elif action == "create_person":
+                            store.resolve_review(review["id"], action, new_person_name=new_name.value or None, note=note_value, context_note=context_value)
+                        else:
+                            store.resolve_review(review["id"], action, note=note_value)
                         store.save()
                     except ValueError as error:
                         ui.notify(str(error), type="negative")
                         return
                     dialog.close()
-                    ui.notify("Review recorded.", type="positive")
+                    ui.notify("Review disposition recorded locally.", type="positive")
                     refresh_workspace()
-
-                with ui.row().classes("w-full justify-between flex-wrap"):
-                    with ui.row().classes("gap-2"):
-                        ui.button("Leave unassigned", on_click=lambda: resolve("leave_unassigned")).props("flat no-caps")
-                        ui.button("Store in Form Bank", icon="inventory_2", on_click=lambda: resolve("catalog_form")).props("flat no-caps")
-                    with ui.row().classes("gap-2"):
-                        ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
-                        if review.get("revision_of_document_id"):
-                            ui.button("Confirm completed revision", icon="published_with_changes", on_click=lambda: resolve("accept_revision")).props("outline no-caps")
-                        ui.button("Create and file", icon="person_add", on_click=lambda: resolve("create_person")).props("outline no-caps")
-                        ui.button("File with client", icon="assignment_turned_in", on_click=lambda: resolve("assign_existing")).props("no-caps")
             dialog.open()
 
         def open_logical_export_dialog(document_id: str) -> None:
@@ -1336,6 +1373,19 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     with ui.row().classes("items-center gap-2"):
                         if source_url:
                             ui.link("Open in new browser tab", source_url, new_tab=True).classes("text-xs text-primary")
+                        disposition = document.get("staging_disposition") or {}
+                        if disposition.get("kind") == "non_viable":
+                            def reopen_source() -> None:
+                                try:
+                                    store.reopen_non_viable_document(document_id, note="Reopened from the local document viewer.")
+                                    store.save()
+                                except ValueError as error:
+                                    ui.notify(str(error), type="negative")
+                                    return
+                                dialog.close()
+                                ui.notify("Source returned to the review queue. Its earlier disposition remains in history.", type="positive")
+                                refresh_workspace()
+                            ui.button("Reopen review", icon="restore", on_click=reopen_source).props("outline no-caps dense")
                         ui.button(icon="close", on_click=dialog.close).props("flat round dense")
 
                 if source_url:
@@ -1343,6 +1393,10 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                         ui.html(f'<iframe src="{source_url}" class="w-2/3 h-full border-2 border-ink rounded-lg shadow-inner"></iframe>').classes("w-2/3 h-full")
                         with ui.column().classes("w-1/3 h-full overflow-y-auto p-3 bg-cream-bright border-2 border-ink rounded-lg gap-2 text-xs"):
                             ui.label("EXTRACTED EVIDENCE").classes("font-bold text-xs text-secondary uppercase tracking-wider")
+                            if disposition.get("kind") == "non_viable":
+                                ui.label("STAGING DISPOSITION").classes("font-bold text-xs text-secondary uppercase tracking-wider")
+                                ui.label("Non-viable source").classes("text-sm font-semibold text-amber-800")
+                                ui.label(disposition.get("reason", "No reason recorded.")).classes("text-sm muted")
                             extracted = document.get("extracted") or {}
                             for k, v in extracted.items():
                                 if v:

@@ -107,6 +107,33 @@ class ReconciliationTests(unittest.TestCase):
 
             self.assertEqual(groups[0]["documents"][0]["status_code"], "needs_review")
 
+    def test_non_viable_source_is_preserved_excluded_and_can_be_reopened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            document = {
+                "id": "blank-recertification", "original_name": "blank-recertification.pdf",
+                "ingested_at": "2026-07-21T10:00:00Z", "source_text": "General form instructions only.",
+                "extracted": {"document_type": "recertification"},
+            }
+            store.data["documents"].append(document)
+            review_result = store._review(document, "recertification lacks required case identity: hmis_id, participant, program.")
+            review = store.pending_reviews()[0]
+
+            suggestion = store.review_suggestion(review)
+            self.assertEqual(suggestion["kind"], "non_viable")
+
+            store.resolve_review(review_result["review_id"], "archive_non_viable", note="Blank source; no completed participant information.")
+            self.assertEqual(document["staging_disposition"]["kind"], "non_viable")
+            self.assertEqual(document["original_name"], "blank-recertification.pdf")
+            self.assertFalse(store.pending_reviews())
+            self.assertTrue(any(event["type"] == "staging_disposition_recorded" for event in store.data["ledger_events"]))
+
+            reopened = store.reopen_non_viable_document(document["id"], note="A reviewer wants a second look.")
+            self.assertEqual(reopened["status"], "needs_review")
+            self.assertNotIn("staging_disposition", document)
+            self.assertEqual(len(document["staging_disposition_history"]), 1)
+            self.assertTrue(any(event["type"] == "staging_disposition_reopened" for event in store.data["ledger_events"]))
+
 
 if __name__ == "__main__":
     unittest.main()
