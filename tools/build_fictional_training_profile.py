@@ -178,15 +178,15 @@ def quarterly_placements(document_date: str, income: str) -> dict[int, list[tupl
     }
 
 
-def financial_assistance_placements() -> dict[int, list[tuple]]:
+def financial_assistance_placements(document_date: str) -> dict[int, list[tuple]]:
     p = PROFILE
     return {0: [
-        ("text", 175, 597, "01/28/2026"), ("text", 175, 580, p["program"]), ("text", 175, 560, p["name"]),
+        ("text", 175, 597, document_date), ("text", 175, 580, p["program"]), ("text", 175, 560, p["name"]),
         ("check", 99, 487),
         ("text", 140, 422, p["landlord"]), ("text", 140, 406, "123 Fictional Way, Example City, CA 00000"),
         ("text", 140, 390, "$1,000.00"),
         ("text", 140, 352, "February 2026 rental assistance for fictional training profile."),
-        ("text", 100, 256, p["staff"]), ("text", 275, 256, "Caseworker Demo - TRAINING"), ("text", 440, 256, "01/28/2026"),
+        ("text", 100, 256, p["staff"]), ("text", 275, 256, "Caseworker Demo - TRAINING"), ("text", 440, 256, document_date),
     ]}
 
 
@@ -204,11 +204,11 @@ def landlord_placements() -> dict[int, list[tuple]]:
     }
 
 
-def recertification_placements() -> dict[int, list[tuple]]:
+def recertification_placements(document_date: str) -> dict[int, list[tuple]]:
     p = PROFILE
     return {
-        0: [("text", 110, 666, p["first_name"]), ("text", 310, 666, p["last_name"]), ("text", 500, 666, p["hmis_id"]), ("text", 130, 642, "07/15/2026"), ("check", 105, 607), ("check", 105, 538), ("text", 355, 513, p["enrollment"]), ("text", 505, 513, "6"), ("text", 355, 465, "5"), ("text", 355, 441, "06/01/2026"), ("check", 105, 356), ("check", 105, 260)],
-        1: [("check", 105, 678), ("check", 105, 654), ("check", 105, 508), ("check", 105, 486), ("check", 105, 440), ("check", 105, 342), ("text", 105, 220, p["staff"]), ("text", 305, 220, "Caseworker Demo - TRAINING"), ("text", 490, 220, "07/15/2026"), ("text", 105, 196, p["supervisor"]), ("text", 305, 196, "Supervisor Demo - TRAINING"), ("text", 490, 196, "07/15/2026")],
+        0: [("text", 110, 666, p["first_name"]), ("text", 310, 666, p["last_name"]), ("text", 500, 666, p["hmis_id"]), ("text", 130, 642, document_date), ("check", 105, 607), ("check", 105, 538), ("text", 355, 513, p["enrollment"]), ("text", 505, 513, "12"), ("text", 355, 465, "11"), ("text", 355, 441, "12/01/2026"), ("check", 105, 356), ("check", 105, 260)],
+        1: [("check", 105, 678), ("check", 105, 654), ("check", 105, 508), ("check", 105, 486), ("check", 105, 440), ("check", 105, 342), ("text", 105, 220, p["staff"]), ("text", 305, 220, "Caseworker Demo - TRAINING"), ("text", 490, 220, document_date), ("text", 105, 196, p["supervisor"]), ("text", 305, 196, "Supervisor Demo - TRAINING"), ("text", 490, 196, document_date)],
     }
 
 
@@ -232,18 +232,20 @@ def build_profile(template: Path, output: Path, current_profile: dict[str, str])
     output.mkdir(parents=True, exist_ok=True)
     files = {
         "intake": output / f"TRAINING_01_TLS_Intake_Packet_{PROFILE['hmis_id']}.pdf",
-        "financial": output / f"TRAINING_01_Financial_Assistance_Request_{PROFILE['hmis_id']}.pdf",
+        "cfa_february": output / f"TRAINING_01_CFA_2026-02_{PROFILE['hmis_id']}.pdf",
+        "cfa_march": output / f"TRAINING_01_CFA_2026-03_{PROFILE['hmis_id']}.pdf",
         "move_in": output / f"TRAINING_01_Move_In_and_Landlord_Docs_{PROFILE['hmis_id']}.pdf",
-        "quarterly_april": output / f"TRAINING_01_Quarterly_2026-04_{PROFILE['hmis_id']}.pdf",
-        "quarterly_july": output / f"TRAINING_01_Quarterly_2026-07_{PROFILE['hmis_id']}.pdf",
-        "recertification": output / f"TRAINING_01_Recertification_{PROFILE['hmis_id']}.pdf",
+        "quarterly_march": output / f"TRAINING_01_Quarterly_2026-03_{PROFILE['hmis_id']}.pdf",
+        "quarterly_june": output / f"TRAINING_01_Quarterly_2026-06_{PROFILE['hmis_id']}.pdf",
+        "recertification": output / f"TRAINING_01_Recertification_2027-01_{PROFILE['hmis_id']}.pdf",
     }
     overlay_pdf(template / "01. TLS Intake Packet.pdf", files["intake"], intake_placements())
-    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["financial"], financial_assistance_placements())
+    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["cfa_february"], financial_assistance_placements("02/08/2026"))
+    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["cfa_march"], financial_assistance_placements("03/08/2026"))
     overlay_pdf(template / "00. Landlord Docs.pdf", files["move_in"], landlord_placements())
-    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_april"], quarterly_placements("04/15/2026", "$2,380.00"))
-    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_july"], quarterly_placements("07/15/2026", "$2,520.00"))
-    overlay_pdf(template / "BLANK Recertification form.pdf", files["recertification"], recertification_placements())
+    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_march"], quarterly_placements("03/08/2026", "$2,380.00"))
+    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_june"], quarterly_placements("06/08/2026", "$2,520.00"))
+    overlay_pdf(template / "BLANK Recertification form.pdf", files["recertification"], recertification_placements("01/15/2027"))
     write_manifest(output)
     return files
 
@@ -257,7 +259,7 @@ def copy_as(source: Path, destination: Path) -> Path:
 def build_hateful_eight(template: Path, output: Path) -> None:
     """Build independent adversarial upload batches for a clean Homesteader state."""
     global PROFILE
-    root = output / "HATEFUL_EIGHT_FICTIONAL_TRAINING"
+    root = output / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V2_SCHEDULE"
     profiles_root = root / "00_PROFILE_SOURCES"
     profile_files: list[tuple[dict[str, str], dict[str, Path]]] = []
     for number, current in enumerate(HATEFUL_EIGHT, start=1):
@@ -274,14 +276,14 @@ def build_hateful_eight(template: Path, output: Path) -> None:
     # Run 2: incomplete and out-of-order records. Start Homesteader with a new blank state.
     partial = root / "02_PARTIAL_OUT_OF_ORDER_UPLOAD"
     partial_map = {
-        "H-TRAIN-0001": ("intake", "financial"),
-        "H-TRAIN-0002": ("quarterly_july",),  # historical baseline arrives before intake
+        "H-TRAIN-0001": ("intake", "cfa_february"),
+        "H-TRAIN-0002": ("quarterly_june",),  # historical baseline arrives before intake
         "H-TRAIN-0003": ("move_in",),         # first Jasmine: housing material only
-        "H-TRAIN-0004": ("quarterly_april",),  # second Jasmine: same name, distinct HMIS
+        "H-TRAIN-0004": ("quarterly_march",),  # second Jasmine: same name, distinct HMIS
         "H-TRAIN-0005": ("recertification",),  # shares DOB with Casey, different person
-        "H-TRAIN-0006": ("financial",),
-        "H-TRAIN-0007": ("quarterly_april",), # followed by a completed revision below
-        "H-TRAIN-0008": ("move_in", "financial"),
+        "H-TRAIN-0006": ("cfa_march",),
+        "H-TRAIN-0007": ("quarterly_march",), # followed by a completed revision below
+        "H-TRAIN-0008": ("move_in", "cfa_february"),
     }
     partial_sources: list[Path] = []
     for current, files in profile_files:
@@ -294,8 +296,8 @@ def build_hateful_eight(template: Path, output: Path) -> None:
     devin = next(current for current in HATEFUL_EIGHT if current["hmis_id"] == "H-TRAIN-0007")
     incomplete = devin | {"hmis_id": ""}
     PROFILE = incomplete
-    incomplete_path = partial / "99_PARTIAL_Quarterly_2026-04_Devin_Cross_MISSING_HMIS.pdf"
-    overlay_pdf(template / "BLANK Quarterly.pdf", incomplete_path, quarterly_placements("04/15/2026", "$2,380.00"))
+    incomplete_path = partial / "99_PARTIAL_Quarterly_2026-03_Devin_Cross_MISSING_HMIS.pdf"
+    overlay_pdf(template / "BLANK Quarterly.pdf", incomplete_path, quarterly_placements("03/08/2026", "$2,380.00"))
 
     # Run 3: the missing records and completed revision arrive later. Originals remain in Run 2.
     follow_up = root / "03_CORRECTION_AND_MISSING_RECORD_FOLLOW_UP"
@@ -303,13 +305,13 @@ def build_hateful_eight(template: Path, output: Path) -> None:
         for key, source in files.items():
             if key not in partial_map[current["hmis_id"]]:
                 copy_as(source, follow_up / f"FOLLOW_UP_{source.name}")
-    devin_full = next(files["quarterly_april"] for current, files in profile_files if current["hmis_id"] == "H-TRAIN-0007")
-    copy_as(devin_full, follow_up / "COMPLETED_REVISION_Quarterly_2026-04_Devin_Cross_WITH_HMIS.pdf")
+    devin_full = next(files["quarterly_march"] for current, files in profile_files if current["hmis_id"] == "H-TRAIN-0007")
+    copy_as(devin_full, follow_up / "COMPLETED_REVISION_Quarterly_2026-03_Devin_Cross_WITH_HMIS.pdf")
 
     # Run 4: true repeats, intentionally exact-byte copies, for raw-hash dedupe verification.
     duplicates = root / "04_EXACT_DUPLICATE_UPLOADS"
     for current, files in profile_files:
-        source = files["quarterly_july"]
+        source = files["quarterly_june"]
         copy_as(source, duplicates / f"DUPLICATE_{current['hmis_id']}_A.pdf")
         copy_as(source, duplicates / f"DUPLICATE_{current['hmis_id']}_B.pdf")
 
@@ -337,7 +339,7 @@ def main() -> None:
     output = args.output_dir
     if args.hateful_eight:
         build_hateful_eight(template, output)
-        print(output / "HATEFUL_EIGHT_FICTIONAL_TRAINING")
+        print(output / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V2_SCHEDULE")
     else:
         build_profile(template, output, PROFILE)
         print(output)

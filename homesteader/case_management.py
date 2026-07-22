@@ -28,4 +28,10 @@ DOCUMENT_RULES = {
     "income_declaration": CaseDocumentRule(
         "income_declaration", frozenset({"participant", "reporting_period", "hmis_id"}), "income_declaration_recorded"
     ),
+    "financial_assistance_request": CaseDocumentRule(
+        "financial_assistance_request", frozenset({"participant", "program", "hmis_id"}), "financial_assistance_request_recorded"
+    ),
+    "recertification": CaseDocumentRule(
+        "recertification", frozenset({"participant", "program", "hmis_id"}), "recertification_recorded"
+    ),
 }

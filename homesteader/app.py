@@ -1208,7 +1208,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 if schedule_items:
                     ui.label("Program timeline").classes("font-medium mt-3")
                     for item in schedule_items:
-                        state = "Documented" if item["status"] == "documented" else "Missing"
+                        state = {"documented": "Documented", "missing": "Missing", "due": "Due this month", "upcoming": "Upcoming"}.get(item["status"], item["status"].title())
                         ui.label(f"{item['due_date']} · {item['requirement'].title()} · {state}").classes(
                             "text-sm text-teal-800" if item["status"] == "documented" else "text-sm text-amber-800"
                         )

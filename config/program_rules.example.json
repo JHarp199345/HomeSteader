@@ -7,12 +7,24 @@
       "duration_months": 24,
       "scheduled_requirements": [
         {
-          "key": "income_verification",
-          "label": "income eligibility / verification",
+          "key": "monthly_cfa",
+          "label": "client financial assistance request (CFA)",
+          "event_types": ["financial_assistance_request_recorded"],
+          "cadence": "monthly",
+          "due_day": 10
+        },
+        {
+          "key": "quarterly_income_verification",
+          "label": "quarterly income eligibility / verification",
           "event_types": ["income_declaration_recorded", "income_verification_recorded"],
-          "every_months": 3,
-          "starts_at_month": 0,
-          "grace_days": 0
+          "cadence": "calendar_months",
+          "calendar_months": [3, 6, 9, 12]
+        },
+        {
+          "key": "annual_recertification",
+          "label": "annual recertification",
+          "event_types": ["recertification_recorded"],
+          "cadence": "enrollment_month_annual"
         }
       ]
     }

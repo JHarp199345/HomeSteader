@@ -16,7 +16,7 @@ from .audit import correction_findings
 from .case_management import DOCUMENT_RULES
 from .entity_resolution import IdentityDecision, PersonCandidate, resolve_person
 from .extraction import extract_common_facts
-from .housing_services import add_months, load_program_schedules, schedule_for_program, write_default_program_schedules
+from .housing_services import add_months, load_program_schedules, schedule_for_program, scheduled_occurrences, write_default_program_schedules
 from .move_in import core_record_keys, load_move_in_definition, record_keys, write_default_move_in_definition
 from .ocr import recognize_image_with_vision, recognize_pdf_with_vision
 from .exporting import export_logical_parts
@@ -167,8 +167,12 @@ def extract_document(text: str) -> ExtractedDocument:
         document_type = move_in_type
     elif "INCOME DECLARATION" in upper:
         document_type = "income_declaration"
+    elif "CLIENT FINANCIAL ASSISTANCE CHECK REQUEST FORM" in upper or "FINANCIAL ASSISTANCE CHECK REQUEST" in upper:
+        document_type = "financial_assistance_request"
     elif "HOUSEHOLD COMPOSITION & INCOME ELIGIBILITY" in upper or "MYORG CALCULATOR" in upper or "INCOME VERIFICATION" in upper:
         document_type = "income_verification"
+    elif "RECERTIFICATION" in upper:
+        document_type = "recertification"
     elif "CONTACT INFORMATION SHEET" in upper:
         document_type = "contact_information"
     elif "PROGRAM ENROLLMENT" in upper:
@@ -689,14 +693,13 @@ class HomesteaderStore:
                 if event.get("details", {}).get("participant_id") == person["id"]
             ]
             for requirement in schedule.scheduled_requirements:
-                for offset in range(requirement.starts_at_month, schedule.duration_months, requirement.every_months):
-                    due = add_months(start, offset)
+                for occurrence in scheduled_occurrences(requirement, start, end, today):
+                    period_start, period_end, due = occurrence["period_start"], occurrence["period_end"], occurrence["due_date"]
                     # Homesteader begins with whatever real-world checkpoint
                     # it first receives. Historical requirements before that
                     # baseline are not silently converted into accusations.
-                    if due < baseline or due > today or (exit_date and due >= exit_date):
+                    if period_start < baseline or period_start > today or (exit_date and period_start >= exit_date):
                         continue
-                    next_due = add_months(due, requirement.every_months)
                     evidence = []
                     for event in participant_events:
                         if event["type"] not in requirement.event_types:
@@ -707,8 +710,16 @@ class HomesteaderStore:
                             document_day = date.fromisoformat(value) if value else None
                         except ValueError:
                             document_day = None
-                        if document_day and due <= document_day < next_due:
+                        if document_day and period_start <= document_day < period_end:
                             evidence.append(event)
+                    if evidence:
+                        status = "documented"
+                    elif due and today < due:
+                        status = "upcoming"
+                    elif due is None and today < period_end:
+                        status = "due"
+                    else:
+                        status = "missing"
                     statuses.append({
                         "person_id": person["id"], "ptc": person["name"],
                         "participant_identifier": person.get("attributes", {}).get("hmis_id") or person.get("attributes", {}).get("temporary_id") or "",
@@ -716,7 +727,10 @@ class HomesteaderStore:
                         "enrollment_date": start.isoformat(), "baseline_date": baseline.isoformat(), "standard_end_date": end.isoformat(),
                         "exit_date": exit_date.isoformat() if exit_date else None,
                         "requirement_key": requirement.key, "requirement": requirement.label,
-                        "due_date": due.isoformat(), "status": "documented" if evidence else "missing",
+                        "due_date": due.isoformat() if due else period_start.isoformat(),
+                        "due_precision": "day" if due else "month",
+                        "period_start": period_start.isoformat(), "period_end": period_end.isoformat(),
+                        "status": status,
                         "evidence_document_ids": [event["details"]["document_id"] for event in evidence],
                     })
         return sorted(statuses, key=lambda item: (item["ptc"], item["due_date"], item["requirement_key"]))
@@ -1099,7 +1113,7 @@ class HomesteaderStore:
             return self._record_contact_information(document, extracted)
         if extracted.document_type == "housing_record" or extracted.document_type in record_keys(self.move_in_definition):
             return self._record_housing_document(document, extracted)
-        if extracted.document_type in {"program_enrollment", "consent_to_share", "program_exit"}:
+        if extracted.document_type in {"program_enrollment", "consent_to_share", "program_exit", "financial_assistance_request", "recertification"}:
             return self._record_case_document(document, extracted)
         if extracted.document_type == "form_template":
             return self._catalog_form(document)

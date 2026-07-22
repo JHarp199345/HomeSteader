@@ -63,8 +63,11 @@ Reporting period: Initial enrollment - January 2026
             store.ingest(initial)
 
             statuses = store.housing_schedule_status(as_of=date(2026, 4, 11))
-            self.assertEqual([item["status"] for item in statuses], ["documented", "missing"])
-            self.assertEqual(statuses[0]["standard_end_date"], "2028-01-10")
+            quarterly = [item for item in statuses if item["requirement_key"] == "quarterly_income_verification"]
+            self.assertEqual([item["status"] for item in quarterly], ["missing"])
+            self.assertEqual(quarterly[0]["due_date"], "2026-03-01")
+            self.assertEqual(quarterly[0]["due_precision"], "month")
+            self.assertEqual(quarterly[0]["standard_end_date"], "2028-01-10")
             self.assertFalse(any("due diligence" in item["requirement"].casefold() for item in statuses))
             self.assertTrue(any(row["category"] == "Scheduled Record Missing" for row in store.correction_findings()))
 
@@ -157,7 +160,48 @@ Enrollment date: 2026-01-10
             store.add_to_intake_packet(packet["id"], [enrollment])
             self.assertEqual(store.housing_schedule_status(as_of=date(2026, 4, 11)), [])
             store.close_intake_packet(packet["id"])
-            self.assertEqual([item["status"] for item in store.housing_schedule_status(as_of=date(2026, 4, 11))], ["missing", "missing"])
+            statuses = store.housing_schedule_status(as_of=date(2026, 4, 11))
+            self.assertTrue(any(item["requirement_key"] == "quarterly_income_verification" and item["status"] == "missing" for item in statuses))
+
+    def test_tls_scheduler_uses_monthly_cfa_calendar_quarters_and_annual_intake_month(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            store = HomesteaderStore(folder / "state.json")
+            enrollment = folder / "enrollment.txt"
+            enrollment.write_text("""PROGRAM ENROLLMENT
+Participant: Jasmine Morales
+HMIS number: H-000042
+Program: TLS Adult SPA 2
+Enrollment date: 2026-01-10
+""")
+            march_cfa = folder / "march-cfa.txt"
+            march_cfa.write_text("""CLIENT FINANCIAL ASSISTANCE CHECK REQUEST FORM
+Participant: Jasmine Morales
+HMIS ID: H-000042
+Program: TLS Adult SPA 2
+Document date: 2026-03-08
+""")
+            march_quarterly = folder / "march-quarterly.txt"
+            march_quarterly.write_text("""INCOME VERIFICATION
+Participant: Jasmine Morales
+HMIS ID: H-000042
+Program: TLS Adult SPA 2
+Document date: 2026-03-08
+Reporting period: Quarterly recertification - March 2026
+""")
+            store.ingest(enrollment)
+            store.ingest(march_cfa)
+            store.ingest(march_quarterly)
+
+            statuses = store.housing_schedule_status(as_of=date(2027, 1, 15))
+            march_cfa_status = next(item for item in statuses if item["requirement_key"] == "monthly_cfa" and item["period_start"] == "2026-03-01")
+            march_quarterly_status = next(item for item in statuses if item["requirement_key"] == "quarterly_income_verification" and item["period_start"] == "2026-03-01")
+            annual = next(item for item in statuses if item["requirement_key"] == "annual_recertification" and item["period_start"] == "2027-01-01")
+
+            self.assertEqual(march_cfa_status["status"], "documented")
+            self.assertEqual(march_cfa_status["due_date"], "2026-03-10")
+            self.assertEqual(march_quarterly_status["status"], "documented")
+            self.assertEqual(annual["status"], "due")
 
     def test_program_rules_can_be_loaded_from_a_local_file(self):
         with tempfile.TemporaryDirectory() as directory:
