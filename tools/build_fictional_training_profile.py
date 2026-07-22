@@ -9,6 +9,8 @@ participant record or a submission-ready form.
 from __future__ import annotations
 
 import argparse
+import random
+import shutil
 from io import BytesIO
 from pathlib import Path
 
@@ -45,6 +47,25 @@ PROFILE = {
     "provider": "Example Community Health",
     "mental_health": "Example Behavioral Health",
 }
+
+
+def profile(**changes: str) -> dict[str, str]:
+    """Return a fictional variation without ever touching a source template."""
+    return PROFILE | changes
+
+
+# The data intentionally creates difficult but legitimate identity situations.
+# Every value is invented and deliberately unsuitable for any real submission.
+HATEFUL_EIGHT = [
+    profile(name="Jordan Atlas", first_name="Jordan", last_name="Atlas", hmis_id="H-TRAIN-0001", dob="08/14/1992", property="421 Fictional Boulevard", unit="4B"),
+    profile(name="Riley Boone", first_name="Riley", last_name="Boone", hmis_id="H-TRAIN-0002", dob="03/22/1987", property="88 Practice Lane", unit="2A", enrollment="11/15/2025", move_in="12/01/2025"),
+    profile(name="Jasmine Morales", first_name="Jasmine", last_name="Morales", hmis_id="H-TRAIN-0003", dob="05/09/1990", property="1415 Harbor View Avenue", unit="2A", landlord="Harbor View Training LLC", landlord_contact="Avery Collins"),
+    profile(name="Jasmine Morales", first_name="Jasmine", last_name="Morales", hmis_id="H-TRAIN-0004", dob="11/30/1996", property="908 Learning Court", unit="3C", landlord="Learning Court Training LLC", landlord_contact="Avery Collins"),
+    profile(name="Morgan Lee", first_name="Morgan", last_name="Lee", hmis_id="H-TRAIN-0005", dob="02/18/1991", property="73 Sample Street", unit="1D"),
+    profile(name="Casey Reed", first_name="Casey", last_name="Reed", hmis_id="H-TRAIN-0006", dob="02/18/1991", property="73 Sample Street", unit="5A"),
+    profile(name="Devin Cross", first_name="Devin", last_name="Cross", hmis_id="H-TRAIN-0007", dob="07/04/1985", property="220 Example Terrace", unit="7B"),
+    profile(name="Taylor Quinn", first_name="Taylor", last_name="Quinn", hmis_id="H-TRAIN-0008", dob="12/12/1994", property="17 Mockingbird Way", unit="9F"),
+]
 
 BLUE = HexColor("#145A9C")
 RED = Color(0.72, 0.05, 0.05, alpha=0.78)
@@ -204,22 +225,122 @@ def write_manifest(output: Path) -> None:
     )
 
 
+def build_profile(template: Path, output: Path, current_profile: dict[str, str]) -> dict[str, Path]:
+    """Create one self-contained fictional profile and return its source copies."""
+    global PROFILE
+    PROFILE = current_profile
+    output.mkdir(parents=True, exist_ok=True)
+    files = {
+        "intake": output / f"TRAINING_01_TLS_Intake_Packet_{PROFILE['hmis_id']}.pdf",
+        "financial": output / f"TRAINING_01_Financial_Assistance_Request_{PROFILE['hmis_id']}.pdf",
+        "move_in": output / f"TRAINING_01_Move_In_and_Landlord_Docs_{PROFILE['hmis_id']}.pdf",
+        "quarterly_april": output / f"TRAINING_01_Quarterly_2026-04_{PROFILE['hmis_id']}.pdf",
+        "quarterly_july": output / f"TRAINING_01_Quarterly_2026-07_{PROFILE['hmis_id']}.pdf",
+        "recertification": output / f"TRAINING_01_Recertification_{PROFILE['hmis_id']}.pdf",
+    }
+    overlay_pdf(template / "01. TLS Intake Packet.pdf", files["intake"], intake_placements())
+    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["financial"], financial_assistance_placements())
+    overlay_pdf(template / "00. Landlord Docs.pdf", files["move_in"], landlord_placements())
+    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_april"], quarterly_placements("04/15/2026", "$2,380.00"))
+    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_july"], quarterly_placements("07/15/2026", "$2,520.00"))
+    overlay_pdf(template / "BLANK Recertification form.pdf", files["recertification"], recertification_placements())
+    write_manifest(output)
+    return files
+
+
+def copy_as(source: Path, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return destination
+
+
+def build_hateful_eight(template: Path, output: Path) -> None:
+    """Build independent adversarial upload batches for a clean Homesteader state."""
+    global PROFILE
+    root = output / "HATEFUL_EIGHT_FICTIONAL_TRAINING"
+    profiles_root = root / "00_PROFILE_SOURCES"
+    profile_files: list[tuple[dict[str, str], dict[str, Path]]] = []
+    for number, current in enumerate(HATEFUL_EIGHT, start=1):
+        folder = profiles_root / f"{number:02d}_{current['hmis_id']}_{current['name'].replace(' ', '_')}"
+        profile_files.append((current, build_profile(template, folder, current)))
+
+    # Run 1: all complete records, deliberately shuffled and without client folders.
+    full = root / "01_FULL_MIXED_UPLOAD"
+    all_sources = [file for _, files in profile_files for file in files.values()]
+    random.Random(8).shuffle(all_sources)
+    for index, source in enumerate(all_sources, start=1):
+        copy_as(source, full / f"{index:02d}_MIXED_{source.name}")
+
+    # Run 2: incomplete and out-of-order records. Start Homesteader with a new blank state.
+    partial = root / "02_PARTIAL_OUT_OF_ORDER_UPLOAD"
+    partial_map = {
+        "H-TRAIN-0001": ("intake", "financial"),
+        "H-TRAIN-0002": ("quarterly_july",),  # historical baseline arrives before intake
+        "H-TRAIN-0003": ("move_in",),         # first Jasmine: housing material only
+        "H-TRAIN-0004": ("quarterly_april",),  # second Jasmine: same name, distinct HMIS
+        "H-TRAIN-0005": ("recertification",),  # shares DOB with Casey, different person
+        "H-TRAIN-0006": ("financial",),
+        "H-TRAIN-0007": ("quarterly_april",), # followed by a completed revision below
+        "H-TRAIN-0008": ("move_in", "financial"),
+    }
+    partial_sources: list[Path] = []
+    for current, files in profile_files:
+        partial_sources.extend(files[key] for key in partial_map[current["hmis_id"]])
+    random.Random(81).shuffle(partial_sources)
+    for index, source in enumerate(partial_sources, start=1):
+        copy_as(source, partial / f"{index:02d}_PARTIAL_{source.name}")
+
+    # A deliberately incomplete quarterly revision for Devin: same person and period, no HMIS ID.
+    devin = next(current for current in HATEFUL_EIGHT if current["hmis_id"] == "H-TRAIN-0007")
+    incomplete = devin | {"hmis_id": ""}
+    PROFILE = incomplete
+    incomplete_path = partial / "99_PARTIAL_Quarterly_2026-04_Devin_Cross_MISSING_HMIS.pdf"
+    overlay_pdf(template / "BLANK Quarterly.pdf", incomplete_path, quarterly_placements("04/15/2026", "$2,380.00"))
+
+    # Run 3: the missing records and completed revision arrive later. Originals remain in Run 2.
+    follow_up = root / "03_CORRECTION_AND_MISSING_RECORD_FOLLOW_UP"
+    for current, files in profile_files:
+        for key, source in files.items():
+            if key not in partial_map[current["hmis_id"]]:
+                copy_as(source, follow_up / f"FOLLOW_UP_{source.name}")
+    devin_full = next(files["quarterly_april"] for current, files in profile_files if current["hmis_id"] == "H-TRAIN-0007")
+    copy_as(devin_full, follow_up / "COMPLETED_REVISION_Quarterly_2026-04_Devin_Cross_WITH_HMIS.pdf")
+
+    # Run 4: true repeats, intentionally exact-byte copies, for raw-hash dedupe verification.
+    duplicates = root / "04_EXACT_DUPLICATE_UPLOADS"
+    for current, files in profile_files:
+        source = files["quarterly_july"]
+        copy_as(source, duplicates / f"DUPLICATE_{current['hmis_id']}_A.pdf")
+        copy_as(source, duplicates / f"DUPLICATE_{current['hmis_id']}_B.pdf")
+
+    (root / "README_TEST_RUNS.txt").write_text(
+        "FICTIONAL TRAINING DATA — NOT FOR SUBMISSION\n\n"
+        "Use a fresh Homesteader state for each numbered run.\n"
+        "01_FULL_MIXED_UPLOAD: complete records, shuffled; verify separation and relationship graph.\n"
+        "02_PARTIAL_OUT_OF_ORDER_UPLOAD: incomplete, out of order; verify review, missing-record, and schedule findings.\n"
+        "03_CORRECTION_AND_MISSING_RECORD_FOLLOW_UP: ingest after run 02; verify additions and completed-revision proposals.\n"
+        "04_EXACT_DUPLICATE_UPLOADS: ingest after the relevant source documents; verify raw-hash duplicate review.\n\n"
+        "Identity stress cases:\n"
+        "- Jasmine Morales H-TRAIN-0003 (DOB 05/09/1990) and H-TRAIN-0004 (DOB 11/30/1996).\n"
+        "- Morgan Lee H-TRAIN-0005 and Casey Reed H-TRAIN-0006 share DOB 02/18/1991.\n"
+        "- Devin Cross has an incomplete quarterly form followed by the completed version.\n"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--hateful-eight", action="store_true", help="Create eight fictional profiles and adversarial upload batches.")
     args = parser.parse_args()
     template = args.template_dir
     output = args.output_dir
-    output.mkdir(parents=True, exist_ok=True)
-    overlay_pdf(template / "01. TLS Intake Packet.pdf", output / "TRAINING_01_TLS_Intake_Packet_Jordan_Atlas.pdf", intake_placements())
-    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", output / "TRAINING_01_Financial_Assistance_Request_Jordan_Atlas.pdf", financial_assistance_placements())
-    overlay_pdf(template / "00. Landlord Docs.pdf", output / "TRAINING_01_Move_In_and_Landlord_Docs_Jordan_Atlas.pdf", landlord_placements())
-    overlay_pdf(template / "BLANK Quarterly.pdf", output / "TRAINING_01_Quarterly_2026-04_Jordan_Atlas.pdf", quarterly_placements("04/15/2026", "$2,380.00"))
-    overlay_pdf(template / "BLANK Quarterly.pdf", output / "TRAINING_01_Quarterly_2026-07_Jordan_Atlas.pdf", quarterly_placements("07/15/2026", "$2,520.00"))
-    overlay_pdf(template / "BLANK Recertification form.pdf", output / "TRAINING_01_Recertification_Jordan_Atlas.pdf", recertification_placements())
-    write_manifest(output)
-    print(output)
+    if args.hateful_eight:
+        build_hateful_eight(template, output)
+        print(output / "HATEFUL_EIGHT_FICTIONAL_TRAINING")
+    else:
+        build_profile(template, output, PROFILE)
+        print(output)
 
 
 if __name__ == "__main__":
