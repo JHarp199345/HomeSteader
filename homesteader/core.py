@@ -312,6 +312,35 @@ class HomesteaderStore:
         })
         return saved
 
+    def packet_completeness(self, packet_id: str, requirement: str | None = None) -> dict:
+        """Compare a named intake packet to explicit Form Bank requirements.
+
+        This evaluates only mapped logical records from sources attached to the
+        packet. It never treats a filename, an upload order, or an empty page
+        as proof that required evidence exists.
+        """
+        packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None)
+        if not packet:
+            raise ValueError("Intake packet does not exist.")
+        label = (requirement or packet.get("label") or "").casefold()
+        requirement_name = next((name for name in {tag for layout in self.logical_layouts for part in layout.get("parts", []) for tag in part.get("required_for", [])} if name.casefold() in label), None)
+        if not requirement_name:
+            return {"packet_id": packet_id, "status": "not_configured", "requirement": None, "present": [], "missing": []}
+        documents = {document["id"]: document for document in self.data["documents"]}
+        structures = [documents[doc_id].get("logical_document_structure") for doc_id in packet.get("document_ids", []) if doc_id in documents and documents[doc_id].get("logical_document_structure")]
+        required_parts = [
+            part for layout in self.logical_layouts for part in layout.get("parts", [])
+            if requirement_name in part.get("required_for", [])
+        ]
+        present_ids = {part["id"] for structure in structures for part in structure.get("parts", [])}
+        present = [part for part in required_parts if part["id"] in present_ids]
+        missing = [part for part in required_parts if part["id"] not in present_ids]
+        return {
+            "packet_id": packet_id, "status": "complete" if not missing else "incomplete",
+            "requirement": requirement_name, "present": present, "missing": missing,
+            "mapped_source_count": len(structures),
+        }
+
     def move_in_workflow_status(self, workflow_id: str | None = None) -> list[dict]:
         """Return local move-in readiness without making an external decision."""
         core = core_record_keys(self.move_in_definition)

@@ -59,6 +59,25 @@ class LogicalDocumentPartTests(unittest.TestCase):
             reloaded = HomesteaderStore(Path(directory) / "state.json")
             self.assertEqual(reloaded.logical_layouts[0]["parts"][0]["title"], "Local packet index")
 
+    def test_closed_tls_intake_reports_only_missing_mapped_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            packet = store.start_intake_packet("TLS intake — fictional test")
+            structure = logical_document_parts(
+                "TLS TAB 1 intake checklist ... TLS TAB 6 ... grievance policy ... housing search plan",
+                47,
+                store.logical_layouts,
+            )
+            structure["parts"] = [part for part in structure["parts"] if part["id"] != "hmis_consent"]
+            store.data["documents"].append({"id": "source-1", "logical_document_structure": structure})
+            packet["document_ids"].append("source-1")
+            store.close_intake_packet(packet["id"])
+
+            status = store.packet_completeness(packet["id"])
+
+            self.assertEqual(status["status"], "incomplete")
+            self.assertEqual([part["id"] for part in status["missing"]], ["hmis_consent"])
+
 
 if __name__ == "__main__":
     unittest.main()

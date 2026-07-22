@@ -311,6 +311,11 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 packet = selected_packet()
                 if packet:
                     ui.label(f"{len(packet['document_ids'])} documents | {len(packet['intake_occurrence_ids'])} scans received").classes("text-sm muted")
+                    completeness = store.packet_completeness(packet["id"])
+                    if completeness["status"] == "complete":
+                        ui.label(f"{completeness['requirement']}: mapped local evidence complete").classes("text-sm text-teal-800")
+                    elif completeness["status"] == "incomplete":
+                        ui.label(f"{completeness['requirement']}: {len(completeness['missing'])} mapped record(s) still missing").classes("text-sm text-amber-800")
                     if packet.get("proposed_person_id"):
                         person = next((item for item in store.data["entities"] if item["id"] == packet["proposed_person_id"]), None)
                         ui.label(f"Proposed client: {person['name'] if person else 'available'}").classes("text-sm")

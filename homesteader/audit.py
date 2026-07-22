@@ -15,6 +15,7 @@ RECOMMENDATIONS = {
     "scheduled_record_missing": "Verify whether this scheduled record was completed and upload or document the appropriate record. If an approved exception applies, record that exception in the participant ledger.",
     "revision_confirmation": "Compare both source documents. Confirm the newer copy only if it is the same document instance and its additional fields are supported by the source.",
     "move_in_fact_conflict": "Compare the cited original records, determine the correct value through the appropriate casework process, and preserve the conflicting source records rather than overwriting either one.",
+    "packet_evidence_missing": "Locate the listed source record or document an approved exception. Do not mark the packet ready merely because other pages were uploaded.",
 }
 
 
@@ -100,6 +101,20 @@ def correction_findings(store) -> list[dict]:
                 error=(f"Move-in workflow has conflicting {conflict['field'].replace('_', ' ')} values: "
                        f"{'; '.join(conflict['values'])}."),
                 source="Housing Services move-in workflow consistency check",
+            )
+
+    for packet in store.data.get("intake_packets", []):
+        if packet.get("status") != "closed":
+            continue
+        status = store.packet_completeness(packet["id"])
+        if status["status"] != "incomplete":
+            continue
+        for missing in status["missing"]:
+            append(
+                category="packet_evidence_missing", person_id=packet.get("proposed_person_id"), document=None,
+                error=(f"{status['requirement']} packet '{packet.get('label') or packet['id']}' is missing local evidence for "
+                       f"{missing['title']} (expected pages {missing['start_page']}–{missing['end_page']})."),
+                source="Local Form Bank packet definition",
             )
 
     return sorted(findings, key=lambda row: (row["caseworker"], row["ptc"], row["category"], row["document"]))
