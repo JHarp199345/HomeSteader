@@ -1,6 +1,7 @@
 LANDLORD RENTAL ASSISTANCE ACKNOWLEDGEMENT
 
 Participant: Jasmine Morales
+HMIS ID: H-MOVE-000042
 Landlord: Harbor View Management LLC
 Property address: 1415 Harbor View Avenue
 Unit: 2A

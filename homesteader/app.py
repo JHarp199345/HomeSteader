@@ -43,6 +43,12 @@ def find_available_port(preferred_port: int, attempts: int = 100) -> int:
 
 
 def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
+    # Repair only structural omissions from older imports. This is append-only:
+    # existing properties and documents remain intact while units/programs gain
+    # their proper relationship records.
+    structural_repair = store.reconcile_workspace_structure()
+    if any(structural_repair.values()):
+        store.save()
     # Older local states may predate the evidence-link invariant. Repair only
     # explicit, defensible links before rendering the workspace; the original
     # events and sources remain untouched.
@@ -78,15 +84,25 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             ui.image(source_url).classes(classes + " object-contain bg-white border-2 border-ink rounded-lg")
             return
         if suffix == ".pdf":
-            ui.html(
-                f'<object data="{source_url}" type="application/pdf" class="w-full h-full">'
-                f'<p class="p-4">Inline PDF preview is unavailable. '
-                f'<a href="{source_url}" target="_blank">Open the preserved local PDF.</a></p></object>'
-            ).classes(classes + " border-2 border-ink rounded-lg bg-white overflow-hidden")
+            ui.element("iframe").props(f'src="{source_url}#toolbar=0"').classes(
+                classes + " border-2 border-ink rounded-lg bg-white overflow-hidden w-full h-full"
+            )
             return
-        ui.html(f'<iframe src="{source_url}" class="w-full h-full border-0"></iframe>').classes(
-            classes + " border-2 border-ink rounded-lg bg-white overflow-hidden"
+        ui.element("iframe").props(f'src="{source_url}"').classes(
+            classes + " border-2 border-ink rounded-lg bg-white overflow-hidden w-full h-full"
         )
+
+    def get_thumbnail_url(document: dict | None) -> str | None:
+        if not document:
+            return None
+        path = document.get("thumbnail_path") or store.ensure_form_thumbnail(document["id"])
+        if not path:
+            return None
+        p = Path(path)
+        if "sources" in p.parts or str(path).startswith("sources/"):
+            return f"/homesteader-source/{p.name}"
+        return f"/homesteader-thumbnail/{p.name}"
+
     ui.colors(primary="#1a7f7d", secondary="#d43a2c", accent="#d43a2c", positive="#1a7f7d", negative="#b83a2d")
     ui.add_head_html("""
         <style>
@@ -130,6 +146,13 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
           .bar-btn { background: var(--cream-bright) !important; color: #123c3b !important; border: 2px solid rgba(28,29,31,.9); border-radius: 8px; }
           .bar-btn .q-btn__content { font-family: "Homesteader Display", sans-serif; text-transform: uppercase; letter-spacing: .06em; font-size: .74rem; }
           .q-btn.bar-btn .q-btn__content, .q-btn.bar-btn .q-icon { color: #123c3b !important; }
+          /* The native file input sits transparently over the compact upload
+             icon. This keeps Finder's picker a direct user action; browsers
+             deliberately reject delayed, script-triggered file pickers. */
+          .form-bank-upload-control { position: relative; width: 42px; height: 42px; flex: 0 0 42px; }
+          .form-bank-upload-proxy { position: absolute !important; inset: 0 !important; z-index: 2 !important; width: 42px !important; height: 42px !important; min-height: 42px !important; opacity: 0 !important; overflow: hidden !important; }
+          .form-bank-upload-proxy .q-uploader__header, .form-bank-upload-proxy .q-uploader__header-content, .form-bank-upload-proxy .q-uploader__header-content > div, .form-bank-upload-proxy a.q-btn { position: absolute !important; inset: 0 !important; width: 42px !important; height: 42px !important; min-height: 42px !important; padding: 0 !important; }
+          .form-bank-upload-proxy .q-uploader__list, .form-bank-upload-proxy .q-uploader__title, .form-bank-upload-proxy .q-uploader__subtitle { display: none !important; }
           .form-thumbnail { width: 124px; height: 166px; flex: 0 0 124px; background: white; border: 2px solid var(--ink); border-radius: 7px; overflow: hidden; }
           .form-thumbnail object, .form-thumbnail iframe, .form-thumbnail img { width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
 
@@ -219,11 +242,11 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
     global_search = {"query": ""}
     nav_buttons: dict[str, object] = {}
 
-    def handle_file_upload(e) -> None:
+    async def handle_file_upload(e) -> None:
         """Stage a user-selected file locally without overwriting a prior scan."""
         try:
-            content = e.content.read()
-            filename = Path(getattr(e, "name", "uploaded_document.pdf")).name
+            content = await e.file.read()
+            filename = Path(e.file.name).name
             inbox_path.mkdir(parents=True, exist_ok=True)
             destination = inbox_path / f"upload-{uuid4()}-{filename}"
             destination.write_bytes(content)
@@ -254,6 +277,55 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 ui.label("AUTO-WATCH FOLDER").classes("display-label text-[10px] tracking-widest")
             ui.label(str(inbox_path)).classes("text-xs opacity-90 break-all")
 
+    def open_operator_identity_dialog() -> None:
+        op = store.get_operator_identity()
+        with ui.dialog() as dialog, ui.card().classes("w-[30rem] p-4 gap-3"):
+            ui.label("Operator Identity").classes("text-lg font-bold text-teal-900")
+            ui.label("You're signed in as:").classes("text-sm text-teal-950")
+            name_input = ui.input("Operator Full Name", value=op.get("canonical_name", "")).classes("w-full")
+            ui.label("Registered Aliases (e.g. misspellings like 'Jessie Harper' or initials):").classes("text-xs muted")
+            alias_list = list(op.get("aliases", []))
+            alias_container = ui.column().classes("w-full gap-1")
+
+            def render_aliases() -> None:
+                alias_container.clear()
+                with alias_container:
+                    for idx, alias in enumerate(alias_list):
+                        with ui.row().classes("w-full items-center justify-between bg-cream p-1 px-2 border rounded"):
+                            ui.label(alias).classes("text-xs font-semibold")
+                            def remove_alias(i=idx) -> None:
+                                alias_list.pop(i)
+                                render_aliases()
+                            ui.button(icon="close", on_click=remove_alias).props("flat dense round size=xs")
+
+            render_aliases()
+            new_alias_input = ui.input("Add alias", placeholder="e.g. Jessie Harper").classes("w-full")
+            def add_alias() -> None:
+                val = new_alias_input.value.strip()
+                if val and val not in alias_list:
+                    alias_list.append(val)
+                    new_alias_input.set_value("")
+                    render_aliases()
+
+            ui.button("Add Alias", icon="add", on_click=add_alias).props("outline dense no-caps")
+
+            def save_op() -> None:
+                cname = name_input.value.strip()
+                if not cname:
+                    ui.notify("Operator name cannot be empty.", type="warning")
+                    return
+                store.set_operator_identity(cname, alias_list, confirmed=True)
+                store.save()
+                dialog.close()
+                ui.notify(f"Operator identity saved as '{cname}'.", type="positive")
+                refresh_workspace()
+
+            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                ui.button("Confirm Identity", icon="check", on_click=save_op).props("retro-primary no-caps")
+
+        dialog.open()
+
     with ui.column().classes("page-shell w-full gap-5"):
         with ui.row().classes("w-full items-center gap-6 flex-nowrap"):
             with ui.column().classes("gap-0 shrink-0"):
@@ -263,11 +335,31 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.label("All in One Place.").classes("tagline-script text-3xl")
                     ui.label("✦").classes("starburst text-2xl")
             ui.element("div").classes("flex-grow")
-            with ui.column().classes("workspace-chip gap-0 items-start shrink-0"):
-                with ui.row().classes("items-center gap-2 flex-nowrap"):
-                    ui.label("✦").classes("text-base")
-                    ui.label("LOCAL WORKSPACE").classes("display-label text-sm tracking-widest")
-                ui.label("This computer only").classes("tagline-script text-xl")
+            operator_chip_container = ui.column().classes("shrink-0")
+
+        banner_container = ui.column().classes("w-full gap-0")
+
+        def refresh_operator_banner() -> None:
+            op_info = store.get_operator_identity()
+            operator_chip_container.clear()
+            with operator_chip_container:
+                with ui.column().classes("workspace-chip gap-0 items-start shrink-0 cursor-pointer").on("click", open_operator_identity_dialog):
+                    with ui.row().classes("items-center gap-2 flex-nowrap"):
+                        ui.label("✦").classes("text-base")
+                        ui.label(f"OPERATOR: {op_info.get('canonical_name', 'LOCAL WORKSPACE').upper()}").classes("display-label text-sm tracking-widest")
+                    status_text = "Confirmed signature identity" if op_info.get("confirmed") else "Unconfirmed — click to verify"
+                    ui.label(status_text).classes("tagline-script text-xs opacity-90")
+
+            banner_container.clear()
+            with banner_container:
+                if not op_info.get("confirmed"):
+                    with ui.row().classes("w-full items-center justify-between bg-amber-100 border-2 border-amber-500 rounded-xl p-3 px-4 shadow-sm my-2"):
+                        with ui.row().classes("items-center gap-3"):
+                            ui.icon("account_box", size="24px", color="amber-9").classes("shrink-0")
+                            with ui.column().classes("gap-0"):
+                                ui.label("Identity Confirmation Required").classes("font-bold text-amber-950 text-sm")
+                                ui.label(f"Homesteader detected signature name: '{op_info.get('canonical_name', 'Operator')}' — please confirm how you sign paperwork so foreign documents aren't misfiled.").classes("text-xs text-amber-900")
+                        ui.button("Confirm Identity Now", icon="check_circle", on_click=open_operator_identity_dialog).props("retro-primary dense no-caps")
 
         relationship_panel = ui.column().classes("w-full gap-2")
 
@@ -393,20 +485,42 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                         ui.label(f"Proposed client: {person['name'] if person else 'available'}").classes("text-sm")
                     if packet.get("anchor_conflict"):
                         ui.label(packet["anchor_conflict"]).classes("text-sm text-red-700")
+
+                    packet_doc_ids = packet.get("document_ids") or []
+                    if packet_doc_ids:
+                        ui.label("PACKET DOCUMENTS").classes("text-xs font-bold text-teal-900 tracking-wider mt-3 mb-1")
+                        with ui.row().classes("w-full gap-4 flex-wrap items-start my-2"):
+                            for doc_id in packet_doc_ids:
+                                doc = next((d for d in store.data["documents"] if d["id"] == doc_id), None)
+                                if not doc:
+                                    continue
+                                thumbnail_url = get_thumbnail_url(doc)
+                                with ui.card().classes("p-2 border-2 border-ink bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer w-[140px] items-center gap-1").on("click", lambda did=doc_id, pids=packet_doc_ids: open_document_viewer(did, pids)):
+                                    with ui.element("div").classes("form-thumbnail w-full h-[150px]"):
+                                        if thumbnail_url:
+                                            ui.image(thumbnail_url).classes("w-full h-full object-cover")
+                                        else:
+                                            ui.icon("description", size="42px").classes("text-teal-800 mt-12 ml-[38px]")
+                                    ui.label(doc.get("original_name", "Document")).classes("text-xs font-bold text-teal-950 truncate w-full text-center").tooltip(doc.get("original_name"))
+                                    doc_type_label = (doc.get("extracted") or {}).get("document_type") or doc.get("source_format", "PDF").upper()
+                                    ui.label(doc_type_label).classes("text-[10px] muted font-mono text-center")
+                                    ui.button("Inspect PDF", icon="visibility", on_click=lambda did=doc_id, pids=packet_doc_ids: open_document_viewer(did, pids)).props("flat dense no-caps text-xs").classes("mt-1")
+
                     upload = ui.upload(label="Add documents", multiple=True, auto_upload=True).props('accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff"')
                     upload.on_upload(receive_packet_upload)
-                    with ui.row().classes("gap-2 flex-wrap"):
+                    with ui.row().classes("gap-2 flex-wrap mt-2"):
                         ui.button("Queue new scans", icon="playlist_add", on_click=process_new_scans).props("outline no-caps")
                         ui.button("Close packet", icon="task_alt", on_click=close_selected_packet).props("outline no-caps")
 
-        def receive_packet_upload(event) -> None:
+        async def receive_packet_upload(event) -> None:
             packet = selected_packet()
             if not packet:
                 ui.notify("Open a packet before adding documents.", type="warning")
                 return
             inbox_path.mkdir(parents=True, exist_ok=True)
-            destination = inbox_path / f"upload-{uuid4()}-{Path(event.name).name}"
-            destination.write_bytes(event.content.read())
+            filename = Path(event.file.name).name
+            destination = inbox_path / f"upload-{uuid4()}-{filename}"
+            destination.write_bytes(await event.file.read())
             try:
                 jobs = store.queue_intake_sources(packet["id"], [destination])
                 store.save()
@@ -414,7 +528,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 ui.notify(str(error), type="negative")
                 return
             start_intake_worker()
-            ui.notify(f"Queued {event.name} for local processing." if jobs else f"{event.name} is already waiting to be processed.", type="positive")
+            ui.notify(f"Queued {filename} for local processing." if jobs else f"{filename} is already waiting to be processed.", type="positive")
             refresh_workspace()
 
         def close_selected_packet() -> None:
@@ -553,10 +667,12 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 documents = [
                     document for document in store.data["documents"]
                     if not document.get("intake_packet_id")
+                    and not document.get("evidence_entity_ids")
                     and (document.get("staging_disposition") or {}).get("kind") != "non_viable"
                 ]
+                ui.label("These are preserved incoming sources that are not yet connected to a participant file or an open intake packet. They are a staging list, not an error list.").classes("text-sm muted")
                 if not documents:
-                    ui.label("No detached documents.").classes("muted")
+                    ui.label("No detached documents. Every active source is either connected or awaiting a specific review decision.").classes("muted")
                 for document in documents[-10:]:
                     with ui.row().classes("w-full items-center justify-between"):
                         ui.label(document["original_name"]).classes("text-sm")
@@ -586,24 +702,54 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
                 if not reviews:
                     ui.label("Nothing needs review. Take five, partner.").classes("muted")
+                    return
+
                 categories = {}
                 for review in reviews:
                     category = review.get("category", "other_review")
                     categories[category] = categories.get(category, 0) + 1
                 if categories:
                     ui.label(" · ".join(f"{label.replace('_', ' ')}: {count}" for label, count in sorted(categories.items()))).classes("text-sm muted")
-                shown = reviews if active_view["key"] == "review" else reviews[:4]
-                for review in shown:
-                    document = next((item for item in store.data["documents"] if item["id"] == review["document_id"]), None)
-                    with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
-                        ui.icon("picture_as_pdf", size="34px").classes("text-secondary shrink-0")
-                        with ui.column().classes("gap-0 flex-grow min-w-0"):
-                            ui.label(document["original_name"] if document else "Document review").classes("font-semibold text-sm")
-                            ui.label(review.get("category", "other_review").replace("_", " ").title()).classes("display-label text-xs text-secondary uppercase tracking-wide")
-                            ui.label(review["reason"]).classes("text-sm muted")
-                        ui.button("Review", icon="fact_check", color=None, on_click=lambda review=review: open_review_dialog(review)).classes("retro-secondary shrink-0").props("no-caps dense")
-                if active_view["key"] != "review" and len(reviews) > len(shown):
-                    ui.label(f"View all needs review ({len(reviews)})  ›").classes("view-all").on("click", lambda: set_active_view("review"))
+
+                if active_view["key"] == "review":
+                    # Group reviews by date (oldest first so items sitting longest appear at top)
+                    grouped: dict[tuple[str, str], list[tuple[dict, dict | None]]] = {}
+                    for review in reviews:
+                        doc = next((item for item in store.data["documents"] if item["id"] == review["document_id"]), None)
+                        raw_date = ((doc.get("uploaded_at") if doc else None) or (doc.get("document_date") if doc else None) or review.get("created_at") or "")[:10]
+                        try:
+                            formatted = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%B %d, %Y") if raw_date else "Undated Scans"
+                        except ValueError:
+                            formatted = raw_date or "Undated Scans"
+                        sort_key = raw_date or "9999-99-99"
+                        grouped.setdefault((sort_key, formatted), []).append((review, doc))
+
+                    for (sort_key, date_label), items in sorted(grouped.items(), key=lambda x: x[0][0]):
+                        ui.label(f"📅 {date_label.upper()} ({len(items)} ITEM{'S' if len(items) != 1 else ''})").classes(
+                            "font-semibold text-xs text-secondary uppercase tracking-wider mt-4 mb-2 ml-1"
+                        )
+                        for review, document in items:
+                            with ui.card().classes("w-full p-3 bg-cream-bright border-2 border-ink rounded-lg shadow-sm mb-2"):
+                                with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
+                                    ui.icon("picture_as_pdf", size="34px").classes("text-secondary shrink-0")
+                                    with ui.column().classes("gap-0 flex-grow min-w-0"):
+                                        ui.label(document["original_name"] if document else "Document review").classes("font-semibold text-sm")
+                                        ui.label(review.get("category", "other_review").replace("_", " ").title()).classes("display-label text-xs text-secondary uppercase tracking-wide")
+                                        ui.label(review["reason"]).classes("text-sm muted")
+                                    ui.button("Review", icon="fact_check", color=None, on_click=lambda review=review: open_review_dialog(review)).classes("retro-secondary shrink-0").props("no-caps dense")
+                else:
+                    shown = reviews[:4]
+                    for review in shown:
+                        document = next((item for item in store.data["documents"] if item["id"] == review["document_id"]), None)
+                        with ui.row().classes("w-full items-center justify-between flex-nowrap gap-3"):
+                            ui.icon("picture_as_pdf", size="34px").classes("text-secondary shrink-0")
+                            with ui.column().classes("gap-0 flex-grow min-w-0"):
+                                ui.label(document["original_name"] if document else "Document review").classes("font-semibold text-sm")
+                                ui.label(review.get("category", "other_review").replace("_", " ").title()).classes("display-label text-xs text-secondary uppercase tracking-wide")
+                                ui.label(review["reason"]).classes("text-sm muted")
+                            ui.button("Review", icon="fact_check", color=None, on_click=lambda review=review: open_review_dialog(review)).classes("retro-secondary shrink-0").props("no-caps dense")
+                    if len(reviews) > len(shown):
+                        ui.label(f"View all needs review ({len(reviews)})  ›").classes("view-all").on("click", lambda: set_active_view("review"))
 
         def refresh_correction_findings() -> None:
             correction_panel.clear()
@@ -613,6 +759,10 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.label("Correction Findings").classes("bar-title")
                     with ui.row().classes("items-center gap-2 flex-nowrap"):
                         ui.label(f"{len(findings)} finding{'s' if len(findings) != 1 else ''}").classes("display-label text-sm")
+                        visible_document_ids = sorted({item["document_id"] for item in findings if item.get("document_id")})
+                        if visible_document_ids:
+                            ui.button("Recheck visible", icon="restart_alt", color=None, on_click=lambda ids=visible_document_ids: recheck_documents(ids)).classes("bar-btn").props("no-caps dense").tooltip("Re-evaluate the currently shown stored sources with the current local rules")
+                        ui.button("Recheck all", icon="restart_alt", color=None, on_click=lambda: recheck_documents()).classes("bar-btn").props("no-caps dense").tooltip("Re-evaluate every preserved source with the current local rules")
                         ui.button(icon="filter_list", color=None, on_click=open_correction_filters).classes("bar-btn").props("round dense").tooltip("Filter correction findings")
                         ui.button("View report", icon="summarize", color=None, on_click=lambda findings=findings: open_correction_report(findings)).classes("bar-btn").props("no-caps dense")
                         ui.button("Export XLSX", icon="download", color=None, on_click=lambda findings=findings: download_correction_report(findings)).classes("bar-btn").props("no-caps dense")
@@ -634,9 +784,27 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 ui.label(finding["error"]).classes("text-sm")
                                 ui.label(f"Recommended: {finding['recommendation']}").classes("text-sm text-primary font-medium")
                             if finding["document_id"]:
-                                ui.button(icon="visibility", on_click=lambda document_id=finding["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
+                                with ui.row().classes("shrink-0"):
+                                    ui.button(icon="restart_alt", on_click=lambda document_id=finding["document_id"]: recheck_documents([document_id])).props("flat dense round").tooltip("Recheck this stored source")
+                                    ui.button(icon="visibility", on_click=lambda document_id=finding["document_id"]: open_document_viewer(document_id)).props("flat dense round").tooltip("View stored source")
                 if active_view["key"] != "reports" and len(findings) > len(shown):
                     ui.label(f"View all correction findings ({len(findings)})  ›").classes("view-all").on("click", lambda: set_active_view("reports"))
+
+        def recheck_documents(document_ids: list[str] | None = None) -> None:
+            """Run the current deterministic checks without re-uploading sources."""
+            result = store.recheck_documents(document_ids)
+            structure = store.reconcile_workspace_structure()
+            store.save()
+            scope = "selected sources" if document_ids is not None else "all preserved sources"
+            ui.notify(
+                f"Rechecked {result['documents_examined']} {scope}: "
+                f"{result['fields_added']} fact(s) recovered, "
+                f"{result['reviews_resolved']} finding(s) resolved.",
+                type="positive",
+            )
+            if any(structure.values()):
+                ui.notify("Related units or configured programs were added to the local relationship index.", type="positive")
+            refresh_workspace()
 
         def open_correction_filters() -> None:
             all_findings = store.correction_findings()
@@ -747,11 +915,15 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 ui.label("Upload Documents").classes("text-xl font-semibold")
                             ui.button(icon="close", on_click=dialog.close).props("flat round dense")
                         ui.label("Select multiple files or drag email attachments directly to stage into your local intake folder.").classes("text-sm muted mb-3")
+                        async def stage_and_close(event) -> None:
+                            await handle_file_upload(event)
+                            dialog.close()
+
                         ui.upload(
                             label="📁 Pick or Drop Files",
                             multiple=True,
                             auto_upload=True,
-                            on_upload=lambda e: (handle_file_upload(e), dialog.close()),
+                            on_upload=stage_and_close,
                         ).props("flat color=teal text-color=teal-10").classes("retro-secondary w-full")
                     dialog.open()
 
@@ -867,53 +1039,135 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
 
         def open_packet_definition_editor() -> None:
             store.initialize_logical_layouts()
-            # This first editor handles the current known layout. More packet
-            # types can be added as independent definitions later.
-            if not store.logical_layouts:
+            layouts = list(store.logical_layouts)
+            if not layouts:
                 ui.notify("No packet definitions are available.", type="warning")
                 return
-            layout = store.logical_layouts[0]
-            with ui.dialog() as dialog, ui.card().classes("w-[62rem] max-w-full"):
-                ui.label("Packet definition").classes("text-xl font-semibold")
-                ui.label("These are the logical records inside one source PDF. Adjusting this map affects future recognition and selected exports; it never changes archived sources.").classes("text-sm muted")
-                title = ui.input("Packet name", value=layout["title"]).classes("w-full")
-                rows: list[tuple[dict, object, object, object, object]] = []
-                with ui.row().classes("w-full gap-2 items-center"):
-                    ui.label("Logical document").classes("w-64 font-medium")
-                    ui.label("Section").classes("w-40 font-medium")
-                    ui.label("Start").classes("w-16 font-medium")
-                    ui.label("End").classes("w-16 font-medium")
-                for part in layout["parts"]:
-                    with ui.row().classes("w-full gap-2 items-center"):
-                        part_title = ui.input(value=part["title"]).classes("w-64")
-                        section = ui.input(value=part["section"]).classes("w-40")
-                        start = ui.number(value=part["start_page"], min=1, precision=0).classes("w-16")
-                        end = ui.number(value=part["end_page"], min=1, precision=0).classes("w-16")
-                        rows.append((part, part_title, section, start, end))
 
-                def save_definition() -> None:
-                    updated_parts = []
-                    try:
-                        for part, part_title, section, start, end in rows:
-                            updated_parts.append(part | {
-                                "title": (part_title.value or "").strip(),
-                                "section": (section.value or "").strip(),
-                                "start_page": int(start.value), "end_page": int(end.value),
+            with ui.dialog() as dialog, ui.card().classes("w-[66rem] max-w-full gap-4 p-5"):
+                ui.label("Packet & Form Definitions").classes("text-xl font-bold text-teal-950")
+                ui.label("These rules define the required logical documents inside composite PDFs and cataloged Form Bank templates. Adjusting these definitions affects packet completeness and automated export.").classes("text-sm muted")
+
+                selected_layout_id = {"id": layouts[0]["layout_id"]}
+                options = {layout["layout_id"]: layout["title"] for layout in store.logical_layouts}
+
+                layout_container = ui.column().classes("w-full gap-3")
+
+                def render_editor() -> None:
+                    layout_container.clear()
+                    curr = next((item for item in store.logical_layouts if item["layout_id"] == selected_layout_id["id"]), store.logical_layouts[0])
+                    with layout_container:
+                        with ui.row().classes("w-full items-center gap-4 flex-wrap bg-cream p-3 border rounded-lg"):
+                            title_input = ui.input("Packet Definition Title", value=curr["title"]).classes("w-80 font-bold")
+                            min_pages_input = ui.number("Minimum PDF Pages", value=curr.get("minimum_pages", 1), min=1, precision=0).classes("w-40")
+
+                        ui.label("Logical Document Parts").classes("font-bold text-sm text-teal-900 mt-2")
+                        parts_list = list(curr.get("parts", []))
+                        rows_container = ui.column().classes("w-full gap-2")
+
+                        def render_parts() -> None:
+                            rows_container.clear()
+                            with rows_container:
+                                with ui.row().classes("w-full gap-2 items-center text-xs font-bold text-teal-900 border-b pb-1"):
+                                    ui.label("Logical document title").classes("w-56")
+                                    ui.label("Section").classes("w-32")
+                                    ui.label("Start").classes("w-14")
+                                    ui.label("End").classes("w-14")
+                                    ui.label("Required For Tags").classes("w-44")
+                                    ui.label("Action").classes("w-12")
+                                for idx, part in enumerate(parts_list):
+                                    with ui.row().classes("w-full gap-2 items-center"):
+                                        p_title = ui.input(value=part["title"]).classes("w-56")
+                                        p_sec = ui.input(value=part.get("section", "General")).classes("w-32")
+                                        p_start = ui.number(value=part.get("start_page", 1), min=1, precision=0).classes("w-14")
+                                        p_end = ui.number(value=part.get("end_page", 1), min=1, precision=0).classes("w-14")
+                                        req_str = ", ".join(part.get("required_for", []))
+                                        p_req = ui.input(value=req_str, placeholder="e.g. Move-In, TLS intake").classes("w-44")
+
+                                        def update_part(i=idx, pt=p_title, ps=p_sec, p1=p_start, p2=p_end, pr=p_req) -> None:
+                                            parts_list[i]["title"] = pt.value.strip()
+                                            parts_list[i]["section"] = ps.value.strip()
+                                            parts_list[i]["start_page"] = int(p1.value)
+                                            parts_list[i]["end_page"] = int(p2.value)
+                                            parts_list[i]["required_for"] = [t.strip() for t in pr.value.split(",") if t.strip()]
+
+                                        p_title.on("change", update_part)
+                                        p_sec.on("change", update_part)
+                                        p_start.on("change", update_part)
+                                        p_end.on("change", update_part)
+                                        p_req.on("change", update_part)
+
+                                        def remove_part(i=idx) -> None:
+                                            parts_list.pop(i)
+                                            render_parts()
+
+                                        ui.button(icon="delete", on_click=remove_part).props("flat dense round color=red")
+
+                        render_parts()
+
+                        def add_new_part() -> None:
+                            parts_list.append({
+                                "id": f"part_{len(parts_list) + 1}",
+                                "title": "New Blank Form Part",
+                                "section": "General",
+                                "start_page": 1,
+                                "end_page": 1,
+                                "required_for": [curr["title"]],
                             })
-                        updated_layout = layout | {"title": (title.value or "").strip(), "parts": updated_parts}
-                        layouts = [updated_layout if item["layout_id"] == layout["layout_id"] else item for item in store.logical_layouts]
-                        store.save_logical_layouts(layouts)
-                        store.save()
-                    except (TypeError, ValueError) as error:
-                        ui.notify(f"Packet definition could not be saved: {error}", type="negative")
-                        return
-                    dialog.close()
-                    ui.notify("Packet definition saved locally for future intake and export.", type="positive")
-                    refresh_workspace()
+                            render_parts()
 
-                with ui.row().classes("w-full justify-end mt-3"):
-                    ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
-                    ui.button("Save definition", icon="save", on_click=save_definition).props("no-caps")
+                        ui.button("Add Logical Document Part", icon="add", on_click=add_new_part).props("outline dense no-caps").classes("mt-1")
+
+                        def save_this_layout() -> None:
+                            try:
+                                updated_layout = curr | {
+                                    "title": title_input.value.strip(),
+                                    "minimum_pages": int(min_pages_input.value),
+                                    "parts": parts_list,
+                                }
+                                updated_all = [updated_layout if item["layout_id"] == curr["layout_id"] else item for item in store.logical_layouts]
+                                store.save_logical_layouts(updated_all)
+                                store.save()
+                                dialog.close()
+                                ui.notify(f"Packet definition '{updated_layout['title']}' saved.", type="positive")
+                                refresh_workspace()
+                            except (TypeError, ValueError) as err:
+                                ui.notify(f"Could not save definition: {err}", type="negative")
+
+                        with ui.row().classes("w-full justify-end gap-2 mt-4 border-t pt-3"):
+                            ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                            ui.button("Save Definition", icon="save", on_click=save_this_layout).props("retro-primary no-caps")
+
+                with ui.row().classes("w-full items-center justify-between bg-cream p-3 border rounded-lg flex-wrap gap-2"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label("Select Packet Definition:").classes("font-bold text-teal-900")
+                        selector = ui.select(options, value=selected_layout_id["id"]).classes("w-72")
+                    def change_layout(e) -> None:
+                        selected_layout_id["id"] = e.value
+                        render_editor()
+                    selector.on("update:model-value", change_layout)
+
+                    def create_new_definition() -> None:
+                        new_id = f"custom_packet_{uuid4().hex[:6]}"
+                        new_layout = {
+                            "layout_id": new_id,
+                            "title": "Custom Packet Definition",
+                            "minimum_pages": 1,
+                            "recognition": {"all_text_markers": []},
+                            "parts": [
+                                {"id": "part_1", "title": "Required Blank Form", "start_page": 1, "end_page": 1, "section": "General", "required_for": ["Custom Packet Definition"]}
+                            ]
+                        }
+                        store.logical_layouts.append(new_layout)
+                        store.save_logical_layouts(store.logical_layouts)
+                        selected_layout_id["id"] = new_id
+                        options[new_id] = new_layout["title"]
+                        selector.set_options(options, value=new_id)
+                        render_editor()
+
+                    ui.button("New Packet Definition", icon="post_add", on_click=create_new_definition).props("retro-secondary dense no-caps")
+
+                render_editor()
             dialog.open()
 
         def print_form_template(document_id: str) -> None:
@@ -942,13 +1196,13 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 """ % json.dumps(source_url)
             )
 
-        def receive_form_bank_upload(event) -> None:
+        async def receive_form_bank_upload(event) -> None:
             """Archive a human-designated reusable blank form without filing it."""
             try:
                 inbox_path.mkdir(parents=True, exist_ok=True)
-                filename = Path(event.name).name
+                filename = Path(event.file.name).name
                 destination = inbox_path / f"form-bank-{uuid4()}-{filename}"
-                destination.write_bytes(event.content.read())
+                destination.write_bytes(await event.file.read())
                 result = store.ingest_form_template(destination, original_name=filename)
                 store.save()
             except (OSError, ValueError, AttributeError) as error:
@@ -962,29 +1216,6 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
             }
             ui.notify(messages.get(action, "Blank form preserved in the local Form Bank."), type="positive")
             refresh_workspace()
-
-        def open_form_bank_upload_dialog() -> None:
-            """Use a visible chooser rather than a hidden UI component."""
-            with ui.dialog() as dialog, ui.card().classes("w-[32rem] max-w-full p-5"):
-                with ui.row().classes("w-full items-center justify-between mb-2"):
-                    with ui.row().classes("items-center gap-2"):
-                        ui.icon("upload_file", size="24px").classes("text-teal-700")
-                        ui.label("Add blank form").classes("text-xl font-semibold")
-                    ui.button(icon="close", on_click=dialog.close).props("flat round dense")
-                ui.label("Choose a reusable blank form. Homesteader will preserve it locally, deduplicate exact copies, and keep it out of participant files.").classes("text-sm muted mb-3")
-
-                def receive_and_close(event) -> None:
-                    receive_form_bank_upload(event)
-                    dialog.close()
-
-                ui.upload(
-                    label="Choose blank form",
-                    multiple=True,
-                    auto_upload=True,
-                    on_upload=receive_and_close,
-                    on_rejected=lambda: ui.notify("That file type is not supported for the local Form Bank.", type="warning"),
-                ).props('accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff" flat color=teal text-color=teal-10').classes("retro-secondary w-full")
-            dialog.open()
 
         def set_current_form_template(form_id: str, document_id: str) -> None:
             try:
@@ -1002,9 +1233,13 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 with ui.row().classes("panel-bar bar-teal"):
                     ui.label("Form Bank").classes("bar-title")
                     with ui.row().classes("items-center gap-2"):
-                        ui.button(icon="upload", on_click=open_form_bank_upload_dialog).props(
-                            "round dense"
-                        ).classes("bar-btn").tooltip("Add blank form")
+                        with ui.element("div").classes("form-bank-upload-control").tooltip("Add blank form"):
+                            ui.button(icon="upload").props("round dense").classes("bar-btn")
+                            ui.upload(
+                                multiple=True,
+                                auto_upload=True,
+                                on_upload=receive_form_bank_upload,
+                            ).props('accept=".pdf,.txt,.png,.jpg,.jpeg,.heic,.tif,.tiff"').classes("form-bank-upload-proxy")
                         ui.button("Packet definitions", icon="rule", on_click=open_packet_definition_editor).props(
                             "no-caps dense"
                         ).classes("bar-btn")
@@ -1028,10 +1263,10 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                 None,
                             )
                             if current_document and current_document.get("stored_source_path"):
-                                thumbnail_path = current_document.get("thumbnail_path") or store.ensure_form_thumbnail(current_document["id"])
+                                thumbnail_url = get_thumbnail_url(current_document)
                                 with ui.element("div").classes("form-thumbnail"):
-                                    if thumbnail_path:
-                                        ui.image(f"/homesteader-thumbnail/{Path(thumbnail_path).name}").classes("w-full h-full object-cover")
+                                    if thumbnail_url:
+                                        ui.image(thumbnail_url).classes("w-full h-full object-cover")
                                     else:
                                         ui.icon("description", size="42px").classes("text-teal-800 mt-14 ml-10")
                             with ui.column().classes("gap-0 grow min-w-0"):
@@ -1178,7 +1413,11 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                                                             "needs_review": "warning",
                                                             "true_duplicate": "grey-7"
                                                         }.get(doc["status_code"], "grey")
-                                                        ui.badge(doc["status_label"], color=pill_color).props("dense text-xs")
+                                                        status_badge = ui.badge(doc["status_label"], color=pill_color).props("dense text-xs")
+                                                        if doc["status_code"] == "needs_review":
+                                                            status_badge.classes("cursor-pointer hover:opacity-80")
+                                                            status_badge.on("click", lambda did=doc["id"]: open_review_for_document(did))
+                                                            status_badge.tooltip("Click to open review workbench for this document")
                                                     doc_details = []
                                                     if doc.get("document_date"):
                                                         doc_details.append(f"Date: {doc['document_date']}")
@@ -1278,6 +1517,18 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                 documented = ui.checkbox("Show documented items", value=calendar_state["include_documented"])
                 documented.on("update:model-value", lambda: (calendar_state.update({"include_documented": documented.value}), refresh_calendar()))
                 visible = [event for event in events if event["start"] < end and event["end"] > start]
+                if not rows:
+                    open_packets = [p for p in store.data.get("intake_packets", []) if p.get("status", "open") == "open"]
+                    if open_packets:
+                        ui.label("Intake Packet Currently Open").classes("view-heading text-lg text-amber-900 font-semibold")
+                        ui.label(f"{len(open_packets)} intake packet{' is' if len(open_packets) == 1 else 's are'} currently open. Program compliance and recertification schedules are projected automatically once the intake packet is closed.").classes("text-sm muted")
+                        with ui.row().classes("gap-2 mt-2"):
+                            ui.button("Inspect open intake packet", icon="inventory_2", on_click=lambda: set_active_view("packets")).props("retro-primary dense no-caps")
+                            ui.button("Open correction findings", icon="summarize", on_click=lambda: set_active_view("reports")).props("outline no-caps dense")
+                    else:
+                        ui.label("No verified enrollment schedule is recorded yet.").classes("view-heading text-lg")
+                        ui.label("A configured program and a participant file are not enough to start a timeline. Homesteader needs preserved evidence that states the participant, program, and enrollment date; this prevents it from inventing obligations from an incomplete historical import.").classes("text-sm muted")
+                        ui.button("Open correction findings", icon="summarize", on_click=lambda: set_active_view("reports")).props("outline no-caps").classes("bar-btn")
                 if calendar_state["mode"] == "year":
                     with ui.row().classes("w-full gap-4 flex-wrap"):
                         for month in range(1, 13):
@@ -1521,7 +1772,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     ui.button("Prepare export", icon="folder_zip", on_click=export_selected).props("no-caps")
             dialog.open()
 
-        def open_document_viewer(document_id: str) -> None:
+        def open_document_viewer(document_id: str, document_list: list[str] | None = None) -> None:
             document = next((item for item in store.data["documents"] if item["id"] == document_id), None)
             if not document:
                 ui.notify("The stored document could not be found.", type="negative")
@@ -1534,8 +1785,32 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                         ui.label(document["original_name"]).classes("text-base font-bold text-teal-900")
                         ui.label(f"{document.get('source_format', 'PDF').upper()} · {document.get('source_size_bytes', 0):,} bytes").classes("text-xs muted")
                     with ui.row().classes("items-center gap-2"):
+                        if document_list and len(document_list) > 1 and document_id in document_list:
+                            idx = document_list.index(document_id)
+                            prev_btn = ui.button("Previous", icon="arrow_back", on_click=lambda i=idx: (dialog.close(), open_document_viewer(document_list[i - 1], document_list))).props("outline dense no-caps")
+                            if idx == 0:
+                                prev_btn.disable()
+                            ui.label(f"Document {idx + 1} of {len(document_list)}").classes("text-xs font-bold text-teal-900 mx-1")
+                            next_btn = ui.button("Next", icon="arrow_forward", on_click=lambda i=idx: (dialog.close(), open_document_viewer(document_list[i + 1], document_list))).props("outline dense no-caps")
+                            if idx == len(document_list) - 1:
+                                next_btn.disable()
                         if source_url:
-                            ui.link("Open in new browser tab", source_url, new_tab=True).classes("text-xs text-primary")
+                            def print_document() -> None:
+                                ui.run_javascript(f"const w = window.open('{source_url}', '_blank'); if (w) {{ w.focus(); w.print(); }}")
+
+                            def reveal_in_finder() -> None:
+                                abs_path = store.path.parent / stored_path
+                                if abs_path.exists():
+                                    subprocess.run(["open", "-R", str(abs_path)], check=False)
+                                    ui.notify(f"Revealed '{document['original_name']}' in Finder.", type="positive")
+                                else:
+                                    ui.notify("Stored file path not found on disk.", type="negative")
+
+                            ui.button("Print", icon="print", on_click=print_document).props("outline dense no-caps").tooltip("Print document")
+                            ui.button("Download", icon="download", on_click=lambda: ui.download(source_url, filename=document["original_name"])).props("outline dense no-caps").tooltip("Download PDF copy")
+                            if sys.platform == "darwin":
+                                ui.button("Show in Finder", icon="folder_open", on_click=reveal_in_finder).props("retro-primary dense no-caps").tooltip("Reveal file in macOS Finder for drag-and-drop")
+                            ui.link("Open in tab", source_url, new_tab=True).classes("text-xs text-primary self-center")
                         disposition = document.get("staging_disposition") or {}
                         if disposition.get("kind") == "non_viable":
                             def reopen_source() -> None:
@@ -1830,6 +2105,7 @@ def build_workspace(store: HomesteaderStore, inbox_path: Path) -> None:
                     tab.classes(remove="tab-active-red tab-active-teal")
 
         def refresh_workspace() -> None:
+            refresh_operator_banner()
             refresh_metrics()
             refresh_packets()
             refresh_detached()

@@ -20,6 +20,16 @@
         {"id": "asset_certification", "title": "Under-$5,000 asset certification", "start_page": 44, "end_page": 44, "section": "Income verification", "required_for": ["TLS intake", "TLS annual"]},
         {"id": "housing_search_plan", "title": "Housing search plan and housing history", "start_page": 45, "end_page": 47, "section": "Case management", "required_for": ["TLS intake"]}
       ]
+    },
+    {
+      "layout_id": "landlord_move_in_packet_v1",
+      "title": "Landlord Move-In Packet",
+      "minimum_pages": 1,
+      "recognition": {"all_text_markers": ["LANDLORD"]},
+      "parts": [
+        {"id": "move_in_packet", "title": "Landlord Move-In & Lease Agreement Packet", "start_page": 1, "end_page": 1, "section": "Landlord & Lease", "required_for": ["Move-In", "Landlord Move-In", "move_in_packet"]},
+        {"id": "landlord_w9", "title": "Landlord W-9 Form", "start_page": 1, "end_page": 1, "section": "Landlord & Lease", "required_for": ["Move-In", "Landlord Move-In", "move_in_packet"]}
+      ]
     }
   ]
 }

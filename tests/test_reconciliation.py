@@ -160,6 +160,42 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(len(document["staging_disposition_history"]), 1)
             self.assertTrue(any(event["type"] == "staging_disposition_reopened" for event in store.data["ledger_events"]))
 
+    def test_structural_reconciliation_adds_units_and_configured_programs_without_rewriting_properties(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            participant = store.create_temporary_file("Jasmine Morales")
+            property_entity = store._new_entity("property", "1415 Harbor View Avenue, Unit 2A", address="1415 Harbor View Avenue", unit="2A")
+            store._event("housing_document_recorded", participant["participant_ledger_id"], {
+                "participant_id": participant["person_id"], "property_id": property_entity["id"],
+            })
+
+            repaired = store.reconcile_workspace_structure()
+
+            units = store.entity_directory("unit")
+            programs = store.entity_directory("program")
+            self.assertEqual(repaired["units_added"], 1)
+            self.assertEqual(units[0]["name"], "1415 Harbor View Avenue / 2A")
+            self.assertEqual([row["name"] for row in programs], ["Transitional Living Services"])
+            self.assertTrue(any(item["type"] == "participant_unit_reconciled" for item in store.data["ledger_events"]))
+
+    def test_recheck_resolves_only_a_review_with_exactly_one_current_participant_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomesteaderStore(Path(directory) / "state.json")
+            participant = store.create_temporary_file("Jasmine Morales")
+            document = {
+                "id": "recoverable-consent", "original_name": "consent.pdf", "source_text": "Participant: Jasmine Morales\n",
+                "extracted": {"document_type": "consent_to_share"}, "evidence_entity_ids": [participant["person_id"]],
+            }
+            store.data["documents"].append(document)
+            store._review(document, "consent_to_share lacks required case identity: hmis_id, participant.")
+
+            result = store.recheck_documents([document["id"]])
+
+            self.assertEqual(result["reviews_resolved"], 1)
+            self.assertFalse(store.pending_reviews())
+            self.assertEqual(document["extracted"]["participant"], "Jasmine Morales")
+            self.assertTrue(any(item["type"] == "review_rechecked_resolved" for item in store.data["ledger_events"]))
+
 
 if __name__ == "__main__":
     unittest.main()

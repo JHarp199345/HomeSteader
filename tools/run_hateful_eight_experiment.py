@@ -15,7 +15,7 @@ from homesteader.core import HomesteaderStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FIXTURES = ROOT / "Homesteader Test Documents" / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V2_SCHEDULE"
+DEFAULT_FIXTURES = ROOT / "Homesteader Test Documents" / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V3_MAPPED"
 
 
 def pdf_sources(folder: Path) -> list[Path]:

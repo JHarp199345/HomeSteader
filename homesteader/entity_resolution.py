@@ -56,5 +56,8 @@ def resolve_person(*, name: str, date_of_birth: str | None, candidates: list[Per
         if conflicts:
             return IdentityMatch(IdentityDecision.CREATE_PROVISIONAL, (), ("Same-name candidates have conflicting dates of birth; create a separate provisional identity.",))
     if len(same_name) == 1:
-        return IdentityMatch(IdentityDecision.PROPOSE_EXISTING, (same_name[0].entity_id,), ("Only one same-name candidate exists, but the association remains provisional without a hard identifier.",))
+        # A participant name alone NEVER files a document automatically.
+        # When HMIS ID is missing and DOB is missing, route to Needs Review.
+        return IdentityMatch(IdentityDecision.REVIEW, tuple(candidate.entity_id for candidate in same_name), ("Document carries participant name but lacks corroborating hard identifier (HMIS ID or DOB). Select or confirm intended participant.",))
     return IdentityMatch(IdentityDecision.REVIEW, tuple(candidate.entity_id for candidate in same_name), ("Multiple people share this name and no hard identifier selects one.",))
+

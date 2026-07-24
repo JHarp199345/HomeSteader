@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import random
 import shutil
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
@@ -91,7 +92,239 @@ def watermark(page: canvas.Canvas, width: float, height: float) -> None:
     page.restoreState()
 
 
-def overlay_pdf(source: Path, destination: Path, placements: dict[int, list[tuple]]) -> None:
+@dataclass(frozen=True)
+class TemplateField:
+    """A value location derived from a stable, printed label in a blank PDF.
+
+    These agency forms are flat PDFs: they have printed blanks but no native
+    AcroForm widgets.  We therefore anchor each training value to text that is
+    actually present in the source template, rather than guessing a page
+    coordinate.  If a template revision moves or removes the label, generation
+    stops instead of producing a quietly misaligned training record.
+    """
+
+    page: int
+    label_fragment: str
+    offset_x: float
+    offset_y: float = 0
+    occurrence: int = 0
+    size: float = 8
+
+
+def _text_anchors(page, label_fragment: str) -> list[tuple[float, float]]:
+    """Return PDF coordinates for text fragments matching ``label_fragment``."""
+    matches: list[tuple[float, float]] = []
+    needle = " ".join(label_fragment.lower().split())
+
+    def visitor(text, _cm, tm, _font_dict, _font_size) -> None:
+        rendered = " ".join((text or "").lower().split())
+        if needle and needle in rendered:
+            matches.append((float(tm[4]), float(tm[5])))
+
+    page.extract_text(visitor_text=visitor)
+    return matches
+
+
+def resolve_template_field(page, field: TemplateField, *, field_name: str, page_index: int) -> tuple[float, float, float]:
+    """Resolve a named template field or fail loudly when the template changed."""
+    if field.page != page_index:
+        raise ValueError(f"Field {field_name!r} was requested on page {page_index + 1}, expected page {field.page + 1}.")
+    anchors = _text_anchors(page, field.label_fragment)
+    if len(anchors) <= field.occurrence:
+        raise ValueError(
+            f"Could not map training field {field_name!r}: label fragment "
+            f"{field.label_fragment!r} was not found on page {page_index + 1}."
+        )
+    x, y = anchors[field.occurrence]
+    return x + field.offset_x, y + field.offset_y, field.size
+
+
+def resolve_widget_field(page, field_name: str, *, page_index: int) -> tuple[float, float, float, float]:
+    """Locate a true AcroForm widget when a source PDF provides one.
+
+    A few templates (currently the CFA request) do contain real widgets.  We
+    use their rectangles directly rather than recreating an approximation from
+    label text.  Flat PDFs use ``TemplateField`` above.
+    """
+    for annotation_ref in page.get("/Annots", []):
+        annotation = annotation_ref.get_object()
+        parent_ref = annotation.get("/Parent")
+        parent = parent_ref.get_object() if parent_ref else annotation
+        name = str(parent.get("/T") or annotation.get("/T") or "")
+        if name != field_name:
+            continue
+        left, bottom, right, top = (float(value) for value in annotation["/Rect"])
+        return left, bottom, right, top
+    raise ValueError(f"Could not map AcroForm widget {field_name!r} on page {page_index + 1}.")
+
+
+# Field map for Form 1080.  Values are tied to printed label positions, not a
+# guessed absolute page coordinate.  The "Other" occurrence is deliberately
+# the first one: it is the program field, not the later housing-status field.
+RECERTIFICATION_FIELD_MAP = {
+    "participant_first_name": TemplateField(0, "irst Name", 49),
+    "participant_last_name": TemplateField(0, "ast Name", 44),
+    "hmis_id": TemplateField(0, "HMIS ID:", 55),
+    "recertification_date": TemplateField(0, "ate of Recertification", 95),
+    "annual_recertification": TemplateField(0, "Annual Recertification", -16),
+    "program_other": TemplateField(0, "Other: __", 42),
+    "program_enrollment_date": TemplateField(0, "Program Enrollment Date:", 143),
+    "months_enrolled": TemplateField(0, "Number of Months Enrolled in Program:", 215),
+}
+
+
+# The first three Quarterly pages carry the identity and financial facts that
+# Homesteader is expected to read.  Map those facts to the source labels so the
+# training corpus tests document understanding rather than bad PDF geometry.
+QUARTERLY_FIELD_MAP = {
+    "monthly_participant_name": TemplateField(0, "Participant Name:", 89),
+    "monthly_hmis_id": TemplateField(0, "HMIS ID:", 45),
+    "monthly_meeting_date": TemplateField(0, "Monthly Meeting Date:", 99),
+    "monthly_meeting_time": TemplateField(0, "Monthly Meeting Date:", 366),
+    "monthly_meeting_location": TemplateField(0, "Monthly Meeting Location:", 118),
+    "monthly_category": TemplateField(0, "CATEGORY", 8, -31),
+    "monthly_goals": TemplateField(0, "GOALS", 5, -31),
+    "monthly_status": TemplateField(0, "STATUS:", 5, -31),
+    "income_participant_name": TemplateField(1, "articipant Name", 74),
+    "income_dob": TemplateField(1, "Date of Birth", 59),
+    "income_hmis_id": TemplateField(1, "HMIS #:", 40),
+    "income_source_1": TemplateField(1, "Source: ______________________", 108),
+    "income_amount_1": TemplateField(1, "Amount: ___________", 59),
+    "income_frequency_1": TemplateField(1, "Frequency: _____", 56),
+}
+
+
+CFA_FIELD_MAP = {
+    "check_needed_by": TemplateField(0, "Check Needed by:", 128),
+    "vendor_name": TemplateField(0, "Vendor Name:", 104),
+    "vendor_address": TemplateField(0, "Vendor Address:", 118),
+    "assistance_amount": TemplateField(0, "Amount:", 67),
+    "memo": TemplateField(0, "Memo (if necessary):", 113),
+}
+
+
+INTAKE_FIELD_MAP = {
+    "participant_name": TemplateField(7, "Name:________________________________", 45),
+    "participant_hmis_id": TemplateField(7, "ID", 29),
+    "participant_dob": TemplateField(7, "Birth:", 50),
+    "participant_phone": TemplateField(7, "ell:", 20),
+    "participant_email": TemplateField(7, "Email:", 34),
+}
+
+
+# The landlord packet is a single 13-page source containing several logical
+# forms.  These are the fields that establish the move-in relationship, so
+# they must be tied to the labels printed on each individual form.  In
+# particular, the W-9 is intentionally filled only with the fictional payee
+# information; participant and tenancy facts appear on the pages that actually
+# ask for them.  That keeps the visible evidence and extracted relationships in
+# agreement.
+LANDLORD_FIELD_MAP = {
+    # W-9: vendor/payee evidence only.
+    "w9_legal_name": TemplateField(0, "Name (as shown", 0, -12),
+    "w9_business_name": TemplateField(0, "Business name", 0, -12),
+    "w9_address": TemplateField(0, "Address (number", 0, -12),
+    "w9_city_state_zip": TemplateField(0, "City, state", 0, -12),
+    "w9_signature": TemplateField(0, "Signature of", 42, -7),
+    "w9_date": TemplateField(0, "Date", 22, -7),
+    # Landlord Rental Assistance Acknowledgement (PDF page 7).
+    "ack_date": TemplateField(6, "Date:", 35, -9),
+    "ack_tenant": TemplateField(6, "Tenant", 85, -9),
+    "ack_phone": TemplateField(6, "Phone:_", 35, -9),
+    "ack_landlord": TemplateField(6, "Landlord/Property", 118, -9),
+    "ack_management": TemplateField(6, "Management Company", 146, -9),
+    "ack_owner_phone": TemplateField(6, "Phone:", 40, -9, occurrence=1),
+    "ack_owner_email": TemplateField(6, "Email:", 38, -9),
+    "ack_property": TemplateField(6, "Property", 100, -9, occurrence=1),
+    "ack_city": TemplateField(6, "City:", 34, -9),
+    "ack_state": TemplateField(6, "State:", 36, -9),
+    "ack_zip": TemplateField(6, "Zip", 72, -9),
+    "ack_rent": TemplateField(6, "TENANT’S MONTHLY RENTAL AMOUNT", 185, -9),
+    "ack_due_day": TemplateField(6, "DUE", 42, -9),
+    "ack_mailing_address": TemplateField(6, "Mailing", 62, -9),
+    "ack_owner_name": TemplateField(6, "Owner’s", 100, -9, occurrence=0),
+    "ack_owner_signature": TemplateField(6, "Owner’s", 300, -9, occurrence=0),
+    "ack_signature_date": TemplateField(6, "Date:", 30, -9, occurrence=1),
+    # Unit Information and Owner Certifications (PDF page 8).
+    "unit_tenant": TemplateField(7, "Tenant/Client", 78, -9),
+    "unit_address": TemplateField(7, "Property", 100, -9),
+    "unit_number": TemplateField(7, "Apartment", 75, -9),
+    "unit_city": TemplateField(7, "City:", 34, -9),
+    "unit_state": TemplateField(7, "State:", 36, -9),
+    "unit_zip": TemplateField(7, "Zip", 72, -9),
+    "unit_rent": TemplateField(7, "Requested", 95, -9),
+    "unit_deposit": TemplateField(7, "Security", 85, -9),
+    "unit_move_in": TemplateField(7, "Date Available", 122, -9),
+    "unit_owner": TemplateField(7, "Name of Legal Owner", 105, -9),
+    "unit_owner_address": TemplateField(7, "Owner Address", 95, -9),
+    "unit_owner_phone": TemplateField(7, "Phone:", 40, -9),
+    "unit_owner_email": TemplateField(7, "Email:", 36, -9),
+    # Landlord Incentive Fee Agreement (PDF page 10).
+    "incentive_participant": TemplateField(9, "Participant Name", 80, 0),
+    "incentive_landlord": TemplateField(9, "Name of Landlord", -22, 10),
+    "incentive_applicant": TemplateField(9, "Name of Applicant", -225, 10),
+    "incentive_address": TemplateField(9, "The property is located at", 116, 0),
+    "incentive_unit": TemplateField(9, "Unit #/Apt #", -40, 10),
+    "incentive_city": TemplateField(9, "(City)", -125, 10),
+    "incentive_zip": TemplateField(9, "(Zip Code)", -90, 10),
+    "incentive_rent": TemplateField(9, "Monthly Rent: $", 70, 0),
+    "incentive_deposit": TemplateField(9, "Security Deposit: $", 83, 0),
+    "incentive_move_month": TemplateField(9, "In Date:", 40, 0),
+    "incentive_move_day": TemplateField(9, "In Date:", 84, 0),
+    "incentive_move_year": TemplateField(9, "In Date:", 127, 0),
+    "incentive_payee": TemplateField(9, "Please make checks payable", 140, 0),
+    "incentive_landlord_name": TemplateField(9, "Landlord/ Property Management Name", 175, 0),
+    "incentive_phone": TemplateField(9, "Telephone Number", 90, 0),
+    "incentive_email": TemplateField(9, "mail Address", 72, 0),
+    "incentive_signature": TemplateField(9, "Landlord/ Property Manager Signature", 175, 0),
+    "incentive_date": TemplateField(9, "Date:", 30, 0, occurrence=1),
+    # Move-In Assistance Request (PDF page 11).
+    "move_participant": TemplateField(10, "PARTICIPANT", 105, 0),
+    "move_hmis_id": TemplateField(10, "HMIS#:", 45, 0),
+    "move_landlord": TemplateField(10, "Name of Landlord", -25, 10),
+    "move_applicant": TemplateField(10, "Applicant’s Full Name", -74, 10),
+    "move_address": TemplateField(10, "The property is located at", 123, 0),
+    "move_unit": TemplateField(10, "(Unit #/Apt #)", -55, 10),
+    "move_city": TemplateField(10, "(City)", -125, 10),
+    "move_zip": TemplateField(10, "(Zip Code)", -90, 10),
+    "move_rent": TemplateField(10, "Monthly Rent: $", 74, 0),
+    "move_deposit": TemplateField(10, "Security Deposit: $", 88, 0),
+    "move_month": TemplateField(10, "In Date:", 40, 0),
+    "move_day": TemplateField(10, "In Date:", 84, 0),
+    "move_year": TemplateField(10, "In Date:", 127, 0),
+    "move_payee": TemplateField(10, "Please make checks payable", 145, 0),
+    "move_landlord_name": TemplateField(10, "Landlord/ Property Management Name", 190, 0),
+    "move_phone": TemplateField(10, "Telephone Number", 95, 0),
+    "move_email": TemplateField(10, "mail Address", 78, 0),
+    "move_signature": TemplateField(10, "Landlord/ Property Manager Signature", 185, 0),
+    "move_signature_date": TemplateField(10, "Date:", 32, 0, occurrence=1),
+    # Habitability property information (PDF page 12) and certification (page 13).
+    "habitability_address": TemplateField(11, "Street Address", 75, 0),
+    "habitability_unit": TemplateField(11, "Unit/Apt #", 55, 0),
+    "habitability_city": TemplateField(11, "City:", 28, 0),
+    "habitability_state": TemplateField(11, "State:", 28, 0),
+    "habitability_zip": TemplateField(11, "Zip Code", 44, 0),
+    "habitability_comment": TemplateField(12, "Comments:", 0, -18),
+    "habitability_agency": TemplateField(12, "Certifying Agency", 100, 0),
+    "habitability_staff": TemplateField(12, "Staff Name", 75, 0),
+    "habitability_staff_title": TemplateField(12, "Staff Title", 63, 0),
+    "habitability_staff_signature": TemplateField(12, "Staff Signature", 110, 0),
+    "habitability_staff_date": TemplateField(12, "Date Completed", 80, 0, occurrence=0),
+    "habitability_supervisor": TemplateField(12, "Supervisor Name", 95, 0),
+    "habitability_supervisor_title": TemplateField(12, "Supervisor Title", 90, 0),
+    "habitability_supervisor_signature": TemplateField(12, "Supervisor Signature", 125, 0),
+    "habitability_supervisor_date": TemplateField(12, "Date Completed", 80, 0, occurrence=1),
+    "habitability_household_head": TemplateField(12, "Name of Head of Household", 145, 0),
+}
+
+
+def overlay_pdf(
+    source: Path,
+    destination: Path,
+    placements: dict[int, list[tuple]],
+    *,
+    field_map: dict[str, TemplateField] | None = None,
+) -> None:
     reader = PdfReader(source)
     writer = PdfWriter()
     for index, original_page in enumerate(reader.pages):
@@ -106,6 +339,32 @@ def overlay_pdf(source: Path, destination: Path, placements: dict[int, list[tupl
                 draw_text(layer, *values)
             elif kind == "check":
                 draw_check(layer, *values)
+            elif kind == "field":
+                if field_map is None:
+                    raise ValueError(f"No template field map was supplied for {values[0]!r}.")
+                field_name, text = values
+                field = field_map.get(field_name)
+                if field is None:
+                    raise ValueError(f"Unknown mapped training field {field_name!r}.")
+                x, y, size = resolve_template_field(original_page, field, field_name=field_name, page_index=index)
+                draw_text(layer, x, y, text, size)
+            elif kind == "field_check":
+                if field_map is None:
+                    raise ValueError(f"No template field map was supplied for {values[0]!r}.")
+                field_name = values[0]
+                field = field_map.get(field_name)
+                if field is None:
+                    raise ValueError(f"Unknown mapped training field {field_name!r}.")
+                x, y, _size = resolve_template_field(original_page, field, field_name=field_name, page_index=index)
+                draw_check(layer, x, y)
+            elif kind == "widget":
+                field_name, text = values
+                left, bottom, _right, top = resolve_widget_field(original_page, field_name, page_index=index)
+                draw_text(layer, left + 3, bottom + max(2, (top - bottom - 8) / 2), text)
+            elif kind == "widget_check":
+                field_name = values[0]
+                left, bottom, right, top = resolve_widget_field(original_page, field_name, page_index=index)
+                draw_check(layer, (left + right) / 2 - 3, (bottom + top) / 2 - 3)
         layer.save()
         stream.seek(0)
         original_page.merge_page(PdfReader(stream).pages[0])
@@ -120,9 +379,9 @@ def intake_placements() -> dict[int, list[tuple]]:
     return {
         # Participant information / contact sheet.
         7: [
-            ("text", 55, 645, p["name"]), ("text", 360, 645, p["hmis_id"]),
-            ("text", 85, 621, p["dob"]), ("text", 217, 621, p["phone"]),
-            ("text", 55, 598, p["email"]),
+            ("field", "participant_name", p["name"]), ("field", "participant_hmis_id", p["hmis_id"]),
+            ("field", "participant_dob", p["dob"]), ("field", "participant_phone", p["phone"]),
+            ("field", "participant_email", p["email"]),
             ("text", 100, 498, p["emergency"]), ("text", 385, 498, "Sister"),
             ("text", 65, 479, "123 Training Way, Example City, CA 00000"),
             ("text", 45, 459, "555-0102"),
@@ -145,23 +404,23 @@ def intake_placements() -> dict[int, list[tuple]]:
             ("text", 100, 121, "Caseworker Demo - TRAINING"), ("text", 470, 121, "01/10/2026"),
         ],
         # Program agreement and progressive timeline.
-        12: [("text", 105, 85, p["name"]), ("text", 325, 85, "01/15/2026"), ("text", 105, 62, "Jordan Atlas - TRAINING"), ("text", 325, 62, "01/15/2026"), ("text", 105, 40, "Caseworker Demo - TRAINING"), ("text", 325, 40, "01/15/2026")],
-        14: [("text", 98, 168, p["name"]), ("text", 98, 146, p["staff"]), ("text", 330, 146, "01/15/2026"), ("text", 98, 124, "Jordan Atlas - TRAINING"), ("text", 330, 124, "01/15/2026"), ("text", 98, 102, "Caseworker Demo - TRAINING"), ("text", 330, 102, "01/15/2026")],
+        12: [("text", 105, 85, p["name"]), ("text", 325, 85, "01/15/2026"), ("text", 105, 62, f"{p['name']} - TRAINING"), ("text", 325, 62, "01/15/2026"), ("text", 105, 40, "Caseworker Demo - TRAINING"), ("text", 325, 40, "01/15/2026")],
+        14: [("text", 98, 168, p["name"]), ("text", 98, 146, p["staff"]), ("text", 330, 146, "01/15/2026"), ("text", 98, 124, f"{p['name']} - TRAINING"), ("text", 330, 124, "01/15/2026"), ("text", 98, 102, "Caseworker Demo - TRAINING"), ("text", 330, 102, "01/15/2026")],
         # Consent, privacy, rights, media and transportation acknowledgement signatures.
-        16: [("text", 105, 112, p["name"]), ("text", 105, 90, "Jordan Atlas - TRAINING"), ("text", 330, 90, "01/15/2026"), ("text", 105, 68, "Caseworker Demo - TRAINING"), ("text", 330, 68, "01/15/2026")],
-        23: [("text", 98, 145, p["name"]), ("text", 98, 122, "Jordan Atlas - TRAINING"), ("text", 330, 122, "01/15/2026"), ("text", 98, 99, p["staff"]), ("text", 330, 99, "01/15/2026")],
-        24: [("text", 90, 682, p["name"]), ("text", 90, 660, "Jordan Atlas - TRAINING"), ("text", 330, 660, "01/15/2026"), ("text", 90, 638, p["staff"]), ("text", 330, 638, "01/15/2026")],
-        27: [("text", 95, 194, p["name"]), ("text", 95, 172, "Jordan Atlas - TRAINING"), ("text", 330, 172, "01/15/2026")],
-        28: [("check", 102, 606), ("text", 95, 570, p["name"]), ("text", 95, 548, "Jordan Atlas - TRAINING"), ("text", 330, 548, "01/15/2026"), ("text", 95, 526, p["staff"]), ("text", 330, 526, "01/15/2026")],
-        31: [("text", 95, 676, p["name"]), ("text", 95, 654, "Jordan Atlas - TRAINING"), ("text", 330, 654, "01/15/2026")],
-        32: [("check", 105, 354), ("text", 95, 280, p["name"]), ("text", 95, 258, "Jordan Atlas - TRAINING"), ("text", 330, 258, "01/15/2026"), ("text", 95, 236, p["staff"]), ("text", 330, 236, "01/15/2026")],
-        33: [("text", 95, 594, p["name"]), ("text", 95, 572, "Jordan Atlas - TRAINING"), ("text", 330, 572, "01/15/2026")],
-        34: [("check", 102, 510), ("text", 95, 132, p["name"]), ("text", 95, 110, "Jordan Atlas - TRAINING"), ("text", 330, 110, "01/15/2026"), ("text", 95, 88, p["staff"]), ("text", 330, 88, "01/15/2026")],
+        16: [("text", 105, 112, p["name"]), ("text", 105, 90, f"{p['name']} - TRAINING"), ("text", 330, 90, "01/15/2026"), ("text", 105, 68, "Caseworker Demo - TRAINING"), ("text", 330, 68, "01/15/2026")],
+        23: [("text", 98, 145, p["name"]), ("text", 98, 122, f"{p['name']} - TRAINING"), ("text", 330, 122, "01/15/2026"), ("text", 98, 99, p["staff"]), ("text", 330, 99, "01/15/2026")],
+        24: [("text", 90, 682, p["name"]), ("text", 90, 660, f"{p['name']} - TRAINING"), ("text", 330, 660, "01/15/2026"), ("text", 90, 638, p["staff"]), ("text", 330, 638, "01/15/2026")],
+        27: [("text", 95, 194, p["name"]), ("text", 95, 172, f"{p['name']} - TRAINING"), ("text", 330, 172, "01/15/2026")],
+        28: [("check", 102, 606), ("text", 95, 570, p["name"]), ("text", 95, 548, f"{p['name']} - TRAINING"), ("text", 330, 548, "01/15/2026"), ("text", 95, 526, p["staff"]), ("text", 330, 526, "01/15/2026")],
+        31: [("text", 95, 676, p["name"]), ("text", 95, 654, f"{p['name']} - TRAINING"), ("text", 330, 654, "01/15/2026")],
+        32: [("check", 105, 354), ("text", 95, 280, p["name"]), ("text", 95, 258, f"{p['name']} - TRAINING"), ("text", 330, 258, "01/15/2026"), ("text", 95, 236, p["staff"]), ("text", 330, 236, "01/15/2026")],
+        33: [("text", 95, 594, p["name"]), ("text", 95, 572, f"{p['name']} - TRAINING"), ("text", 330, 572, "01/15/2026")],
+        34: [("check", 102, 510), ("text", 95, 132, p["name"]), ("text", 95, 110, f"{p['name']} - TRAINING"), ("text", 330, 110, "01/15/2026"), ("text", 95, 88, p["staff"]), ("text", 330, 88, "01/15/2026")],
         # Initial income form and budget / asset forms.
         35: [("text", 90, 722, p["name"]), ("text", 340, 722, p["dob"]), ("text", 510, 722, p["hmis_id"]), ("check", 92, 528), ("text", 150, 493, p["income_source"]), ("text", 360, 493, p["income"]), ("text", 490, 493, "Monthly"), ("text", 100, 408, "Training scenario: employer letter unavailable."), ("text", 100, 386, "Fictional data used for Homesteader validation."), ("text", 100, 340, p["staff"]), ("text", 340, 340, "Case Manager"), ("text", 100, 318, "Caseworker Demo - TRAINING"), ("text", 340, 318, "01/15/2026")],
         37: [("text", 140, 716, p["rent"]), ("text", 412, 716, p["income"]), ("text", 140, 690, "$55.00"), ("text", 412, 690, "N/A"), ("text", 140, 664, "$110.00"), ("text", 412, 664, "N/A"), ("text", 140, 638, "$60.00"), ("text", 412, 638, "N/A"), ("text", 410, 102, p["name"])],
-        43: [("text", 95, 680, p["name"]), ("text", 470, 680, "Jordan Atlas - TRAINING"), ("text", 95, 657, p["staff"]), ("text", 470, 657, "01/15/2026")],
-        44: [("text", 95, 651, p["name"]), ("text", 95, 629, "None - fictional training profile"), ("text", 95, 110, "Jordan Atlas - TRAINING"), ("text", 330, 110, "01/15/2026")],
+        43: [("text", 95, 680, p["name"]), ("text", 470, 680, f"{p['name']} - TRAINING"), ("text", 95, 657, p["staff"]), ("text", 470, 657, "01/15/2026")],
+        44: [("text", 95, 651, p["name"]), ("text", 95, 629, "None - fictional training profile"), ("text", 95, 110, f"{p['name']} - TRAINING"), ("text", 330, 110, "01/15/2026")],
         45: [("text", 100, 706, p["name"]), ("text", 100, 678, "Maintain stable housing and build savings."), ("text", 100, 648, "Budget review, landlord communication, employment support."), ("text", 100, 475, p["staff"]), ("text", 330, 475, "01/15/2026")],
         46: [("text", 100, 596, p["name"]), ("text", 100, 570, "Follow up on employment and rent budget."), ("text", 100, 545, "Quarterly financial review completed."), ("text", 100, 520, p["staff"]), ("text", 330, 520, "01/15/2026")],
     }
@@ -170,44 +429,83 @@ def intake_placements() -> dict[int, list[tuple]]:
 def quarterly_placements(document_date: str, income: str) -> dict[int, list[tuple]]:
     p = PROFILE
     return {
-        0: [("text", 148, 694, p["name"]), ("text", 485, 694, p["hmis_id"]), ("text", 145, 646, document_date), ("text", 415, 646, "10:00 AM"), ("text", 165, 617, "Hope the Mission - Training Office"), ("text", 115, 594, "Housing stability"), ("text", 230, 594, "Maintain rent budget and employment"), ("text", 468, 594, "In progress"), ("text", 80, 238, p["name"]), ("text", 270, 238, "Jordan Atlas - TRAINING"), ("text", 455, 238, document_date), ("text", 80, 172, p["staff"]), ("text", 270, 172, "Caseworker Demo - TRAINING"), ("text", 455, 172, document_date), ("text", 80, 116, p["supervisor"]), ("text", 270, 116, "Supervisor Demo - TRAINING"), ("text", 455, 116, document_date)],
-        1: [("text", 105, 705, p["name"]), ("text", 340, 705, p["dob"]), ("text", 505, 705, p["hmis_id"]), ("check", 95, 525), ("text", 150, 494, p["income_source"]), ("text", 360, 494, income), ("text", 495, 494, "Monthly"), ("text", 100, 410, "Fictional training profile; source document simulated."), ("text", 100, 388, "No actual participant or financial data used."), ("text", 100, 340, p["staff"]), ("text", 340, 340, "Case Manager"), ("text", 100, 318, "Caseworker Demo - TRAINING"), ("text", 340, 318, document_date)],
+        0: [
+            ("field", "monthly_participant_name", p["name"]),
+            ("field", "monthly_hmis_id", p["hmis_id"]),
+            ("field", "monthly_meeting_date", document_date),
+            ("field", "monthly_meeting_time", "10:00 AM"),
+            ("field", "monthly_meeting_location", "Hope the Mission - Training Office"),
+            ("field", "monthly_category", "Housing stability"),
+            ("field", "monthly_goals", "Maintain rent budget and employment"),
+            ("field", "monthly_status", "In progress"),
+            ("text", 80, 238, p["name"]), ("text", 270, 238, f"{p['name']} - TRAINING"), ("text", 455, 238, document_date), ("text", 80, 172, p["staff"]), ("text", 270, 172, "Caseworker Demo - TRAINING"), ("text", 455, 172, document_date), ("text", 80, 116, p["supervisor"]), ("text", 270, 116, "Supervisor Demo - TRAINING"), ("text", 455, 116, document_date),
+        ],
+        1: [
+            ("field", "income_participant_name", p["name"]),
+            ("field", "income_dob", p["dob"]),
+            ("field", "income_hmis_id", p["hmis_id"]),
+            ("check", 95, 525),
+            ("field", "income_source_1", p["income_source"]),
+            ("field", "income_amount_1", income),
+            ("field", "income_frequency_1", "Monthly"),
+            ("text", 100, 410, "Fictional training profile; source document simulated."), ("text", 100, 388, "No actual participant or financial data used."), ("text", 100, 340, p["staff"]), ("text", 340, 340, "Case Manager"), ("text", 100, 318, "Caseworker Demo - TRAINING"), ("text", 340, 318, document_date),
+        ],
         2: [("text", 125, 714, p["rent"]), ("text", 410, 714, income), ("text", 125, 688, "$55.00"), ("text", 125, 662, "$110.00"), ("text", 125, 636, "$60.00"), ("text", 410, 100, p["name"])],
-        7: [("text", 105, 706, p["name"]), ("text", 470, 706, "Jordan Atlas - TRAINING"), ("text", 105, 683, p["staff"]), ("text", 470, 683, document_date)],
-        8: [("text", 100, 625, "Not applicable - documented fictional income above."), ("text", 100, 112, "Jordan Atlas - TRAINING"), ("text", 330, 112, document_date)],
+        7: [("text", 105, 706, p["name"]), ("text", 470, 706, f"{p['name']} - TRAINING"), ("text", 105, 683, p["staff"]), ("text", 470, 683, document_date)],
+        8: [("text", 100, 625, "Not applicable - documented fictional income above."), ("text", 100, 112, f"{p['name']} - TRAINING"), ("text", 330, 112, document_date)],
     }
 
 
 def financial_assistance_placements(document_date: str) -> dict[int, list[tuple]]:
     p = PROFILE
     return {0: [
-        ("text", 175, 597, document_date), ("text", 175, 580, p["program"]), ("text", 175, 560, p["name"]),
-        ("check", 99, 487),
-        ("text", 140, 422, p["landlord"]), ("text", 140, 406, "123 Fictional Way, Example City, CA 00000"),
-        ("text", 140, 390, "$1,000.00"),
-        ("text", 140, 352, "February 2026 rental assistance for fictional training profile."),
-        ("text", 100, 256, p["staff"]), ("text", 275, 256, "Caseworker Demo - TRAINING"), ("text", 440, 256, document_date),
+        ("widget", "Date of Request", document_date),
+        ("widget", "Program", p["program"]),
+        ("widget", "Must be from approved program name ndexCl i ent Name", p["name"]),
+        ("widget_check", "Rental Ass"),
+        ("field", "check_needed_by", document_date),
+        ("field", "vendor_name", p["landlord"]),
+        ("field", "vendor_address", "123 Fictional Way, Example City, CA 00000"),
+        ("field", "assistance_amount", "$1,000.00"),
+        ("field", "memo", "February 2026 rental assistance for fictional training profile."),
+        ("widget", "HOTV STAFF Pr i ntRow1", p["staff"]),
+        ("widget", "Signature77", "Caseworker Demo - TRAINING"),
+        ("widget", "DateRow1", document_date),
     ]}
 
 
 def landlord_placements() -> dict[int, list[tuple]]:
     p = PROFILE
+    move_month, move_day, move_year = p["move_in"].split("/")
     return {
-        0: [("text", 95, 698, p["landlord"]), ("text", 95, 676, "Horizon Training Housing LLC"), ("text", 95, 654, "123 Fictional Way"), ("text", 95, 632, "Example City, CA 00000"), ("text", 95, 610, "TRAINING-TIN-0001"), ("text", 390, 274, "Morgan Vale - TRAINING"), ("text", 505, 274, "01/28/2026")],
-        6: [("text", 110, 684, p["landlord"]), ("text", 350, 684, p["name"]), ("text", 110, 662, p["property"]), ("text", 110, 640, "Example City, CA 00000"), ("text", 110, 618, "555-0120"), ("check", 105, 492), ("text", 105, 421, p["rent"]), ("text", 265, 421, p["deposit"]), ("text", 435, 421, "01/01/2026"), ("text", 105, 325, p["landlord"]), ("text", 270, 325, "Morgan Vale - TRAINING"), ("text", 440, 325, "01/28/2026")],
-        7: [("text", 102, 704, p["name"]), ("text", 335, 704, p["landlord"]), ("text", 102, 680, p["property"]), ("text", 102, 656, p["unit"]), ("text", 102, 632, "One bedroom apartment"), ("text", 102, 608, p["rent"]), ("text", 350, 608, p["deposit"]), ("text", 102, 583, p["move_in"]), ("check", 105, 508), ("text", 102, 225, p["landlord_contact"]), ("text", 305, 225, "555-0120"), ("text", 102, 202, "Morgan Vale - TRAINING"), ("text", 305, 202, "01/28/2026")],
-        8: [("text", 115, 414, p["landlord"]), ("text", 115, 392, p["name"]), ("text", 115, 368, p["property"]), ("text", 115, 344, p["unit"]), ("text", 115, 268, "Morgan Vale - TRAINING"), ("text", 330, 268, "01/28/2026")],
-        9: [("text", 100, 706, p["name"]), ("text", 100, 682, p["landlord"]), ("text", 100, 658, p["property"]), ("text", 100, 634, p["unit"]), ("text", 100, 610, p["rent"]), ("text", 100, 412, "Not requested for fictional training profile."), ("text", 100, 116, p["staff"]), ("text", 330, 116, "01/28/2026")],
-        10: [("text", 100, 706, p["name"]), ("text", 455, 706, p["hmis_id"]), ("text", 100, 660, p["staff"]), ("text", 100, 616, p["name"]), ("text", 100, 572, p["landlord"]), ("text", 100, 528, p["property"]), ("text", 100, 504, p["unit"]), ("text", 100, 460, p["move_in"]), ("text", 100, 436, p["rent"]), ("text", 100, 412, p["deposit"]), ("text", 100, 152, "Caseworker Demo - TRAINING"), ("text", 330, 152, "01/28/2026")],
-        11: [("text", 135, 654, "Apartment"), ("text", 135, 630, p["property"]), ("text", 425, 630, p["unit"]), ("text", 135, 606, "Example City"), ("text", 425, 606, "CA"), ("text", 495, 606, "00000"), ("check", 530, 552), ("check", 530, 530), ("check", 530, 508), ("text", 135, 116, p["staff"]), ("text", 425, 116, "Caseworker Demo - TRAINING"), ("text", 135, 94, p["supervisor"]), ("text", 425, 94, "Supervisor Demo - TRAINING"), ("text", 510, 94, "01/28/2026")],
-        12: [("text", 120, 640, "Fictional training inspection completed."), ("text", 120, 615, "Property meets training scenario standards."), ("text", 120, 590, "No repairs requested in fictional exercise."), ("text", 120, 300, "Fictional training profile only."), ("text", 120, 230, "Hope the Mission - Training"), ("text", 120, 206, p["staff"]), ("text", 120, 182, "Caseworker Demo - TRAINING"), ("text", 425, 182, "01/28/2026"), ("text", 120, 158, p["supervisor"]), ("text", 425, 158, "01/28/2026")],
+        # W-9: payee evidence only, never participant facts.
+        0: [("field", "w9_legal_name", p["landlord"]), ("field", "w9_business_name", p["landlord"]), ("field", "w9_address", "123 Fictional Way"), ("field", "w9_city_state_zip", "Example City, CA 00000"), ("field", "w9_signature", f"{p['landlord_contact']} - TRAINING"), ("field", "w9_date", "01/28/2026")],
+        # Landlord acknowledgement and unit certification.
+        6: [("field", "ack_date", "01/28/2026"), ("field", "ack_tenant", p["name"]), ("field", "ack_phone", p["phone"]), ("field", "ack_landlord", p["landlord"]), ("field", "ack_management", p["landlord"]), ("field", "ack_owner_phone", "555-0120"), ("field", "ack_owner_email", "leasing@example.invalid"), ("field", "ack_property", p["property"]), ("field", "ack_city", p["city"]), ("field", "ack_state", "CA"), ("field", "ack_zip", p["zip"]), ("field", "ack_rent", p["rent"]), ("field", "ack_due_day", "1st"), ("field", "ack_mailing_address", "123 Fictional Way"), ("field", "ack_owner_name", p["landlord"]), ("field", "ack_owner_signature", f"{p['landlord_contact']} - TRAINING"), ("field", "ack_signature_date", "01/28/2026")],
+        7: [("field", "unit_tenant", p["name"]), ("field", "unit_address", p["property"]), ("field", "unit_number", p["unit"]), ("field", "unit_city", p["city"]), ("field", "unit_state", "CA"), ("field", "unit_zip", p["zip"]), ("field", "unit_rent", p["rent"]), ("field", "unit_deposit", p["deposit"]), ("field", "unit_move_in", p["move_in"]), ("field", "unit_owner", p["landlord"]), ("field", "unit_owner_address", "123 Fictional Way"), ("field", "unit_owner_phone", "555-0120"), ("field", "unit_owner_email", "leasing@example.invalid")],
+        # Landlord incentive and move-in assistance forms use the same facts,
+        # each in the field where that form actually requests it.
+        9: [("field", "incentive_participant", p["name"]), ("field", "incentive_landlord", p["landlord"]), ("field", "incentive_applicant", p["name"]), ("field", "incentive_address", p["property"]), ("field", "incentive_unit", p["unit"]), ("field", "incentive_city", p["city"]), ("field", "incentive_zip", p["zip"]), ("field", "incentive_rent", p["rent"]), ("field", "incentive_deposit", p["deposit"]), ("field", "incentive_move_month", move_month), ("field", "incentive_move_day", move_day), ("field", "incentive_move_year", move_year), ("field", "incentive_payee", p["landlord"]), ("field", "incentive_landlord_name", p["landlord"]), ("field", "incentive_phone", "555-0120"), ("field", "incentive_email", "leasing@example.invalid"), ("field", "incentive_signature", f"{p['landlord_contact']} - TRAINING"), ("field", "incentive_date", "01/28/2026")],
+        10: [("field", "move_participant", p["name"]), ("field", "move_hmis_id", p["hmis_id"]), ("field", "move_landlord", p["landlord"]), ("field", "move_applicant", p["name"]), ("field", "move_address", p["property"]), ("field", "move_unit", p["unit"]), ("field", "move_city", p["city"]), ("field", "move_zip", p["zip"]), ("field", "move_rent", p["rent"]), ("field", "move_deposit", p["deposit"]), ("field", "move_month", move_month), ("field", "move_day", move_day), ("field", "move_year", move_year), ("field", "move_payee", p["landlord"]), ("field", "move_landlord_name", p["landlord"]), ("field", "move_phone", "555-0120"), ("field", "move_email", "leasing@example.invalid"), ("field", "move_signature", f"{p['landlord_contact']} - TRAINING"), ("field", "move_signature_date", "01/28/2026")],
+        # Habitability property information and its certification page.
+        11: [("field", "habitability_address", p["property"]), ("field", "habitability_unit", p["unit"]), ("field", "habitability_city", p["city"]), ("field", "habitability_state", "CA"), ("field", "habitability_zip", p["zip"]), ("check", 139, 612), ("check", 500, 493), ("check", 500, 467), ("check", 500, 436), ("check", 500, 405), ("check", 500, 370), ("check", 500, 336), ("check", 500, 302), ("check", 500, 267), ("check", 500, 236), ("check", 500, 143)],
+        12: [("check", 44, 630), ("check", 44, 549), ("field", "habitability_comment", "Fictional training inspection: property meets all standards."), ("field", "habitability_agency", "Hope the Mission - Training"), ("field", "habitability_staff", p["staff"]), ("field", "habitability_staff_title", "Case Manager"), ("field", "habitability_staff_signature", "Caseworker Demo - TRAINING"), ("field", "habitability_staff_date", "01/28/2026"), ("field", "habitability_supervisor", p["supervisor"]), ("field", "habitability_supervisor_title", "Supervisor"), ("field", "habitability_supervisor_signature", "Supervisor Demo - TRAINING"), ("field", "habitability_supervisor_date", "01/28/2026"), ("field", "habitability_household_head", p["name"])],
     }
 
 
 def recertification_placements(document_date: str) -> dict[int, list[tuple]]:
     p = PROFILE
     return {
-        0: [("text", 110, 666, p["first_name"]), ("text", 310, 666, p["last_name"]), ("text", 500, 666, p["hmis_id"]), ("text", 130, 642, document_date), ("check", 105, 607), ("check", 105, 538), ("text", 355, 513, p["enrollment"]), ("text", 505, 513, "12"), ("text", 355, 465, "11"), ("text", 355, 441, "12/01/2026"), ("check", 105, 356), ("check", 105, 260)],
+        0: [
+            ("field", "participant_first_name", p["first_name"]),
+            ("field", "participant_last_name", p["last_name"]),
+            ("field", "hmis_id", p["hmis_id"]),
+            ("field", "recertification_date", document_date),
+            ("field_check", "annual_recertification"),
+            ("field", "program_other", p["program"]),
+            ("field", "program_enrollment_date", p["enrollment"]),
+            ("field", "months_enrolled", "12"),
+        ],
         1: [("check", 105, 678), ("check", 105, 654), ("check", 105, 508), ("check", 105, 486), ("check", 105, 440), ("check", 105, 342), ("text", 105, 220, p["staff"]), ("text", 305, 220, "Caseworker Demo - TRAINING"), ("text", 490, 220, document_date), ("text", 105, 196, p["supervisor"]), ("text", 305, 196, "Supervisor Demo - TRAINING"), ("text", 490, 196, document_date)],
     }
 
@@ -239,13 +537,23 @@ def build_profile(template: Path, output: Path, current_profile: dict[str, str])
         "quarterly_june": output / f"TRAINING_01_Quarterly_2026-06_{PROFILE['hmis_id']}.pdf",
         "recertification": output / f"TRAINING_01_Recertification_2027-01_{PROFILE['hmis_id']}.pdf",
     }
-    overlay_pdf(template / "01. TLS Intake Packet.pdf", files["intake"], intake_placements())
-    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["cfa_february"], financial_assistance_placements("02/08/2026"))
-    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["cfa_march"], financial_assistance_placements("03/08/2026"))
-    overlay_pdf(template / "00. Landlord Docs.pdf", files["move_in"], landlord_placements())
-    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_march"], quarterly_placements("03/08/2026", "$2,380.00"))
-    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_june"], quarterly_placements("06/08/2026", "$2,520.00"))
-    overlay_pdf(template / "BLANK Recertification form.pdf", files["recertification"], recertification_placements("01/15/2027"))
+    overlay_pdf(template / "01. TLS Intake Packet.pdf", files["intake"], intake_placements(), field_map=INTAKE_FIELD_MAP)
+    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["cfa_february"], financial_assistance_placements("02/08/2026"), field_map=CFA_FIELD_MAP)
+    overlay_pdf(template / "BLANK Financial Assistance Request.pdf", files["cfa_march"], financial_assistance_placements("03/08/2026"), field_map=CFA_FIELD_MAP)
+    overlay_pdf(
+        template / "00. Landlord Docs.pdf",
+        files["move_in"],
+        landlord_placements(),
+        field_map=LANDLORD_FIELD_MAP,
+    )
+    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_march"], quarterly_placements("03/08/2026", "$2,380.00"), field_map=QUARTERLY_FIELD_MAP)
+    overlay_pdf(template / "BLANK Quarterly.pdf", files["quarterly_june"], quarterly_placements("06/08/2026", "$2,520.00"), field_map=QUARTERLY_FIELD_MAP)
+    overlay_pdf(
+        template / "BLANK Recertification form.pdf",
+        files["recertification"],
+        recertification_placements("01/15/2027"),
+        field_map=RECERTIFICATION_FIELD_MAP,
+    )
     write_manifest(output)
     return files
 
@@ -259,7 +567,7 @@ def copy_as(source: Path, destination: Path) -> Path:
 def build_hateful_eight(template: Path, output: Path) -> None:
     """Build independent adversarial upload batches for a clean Homesteader state."""
     global PROFILE
-    root = output / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V2_SCHEDULE"
+    root = output / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V3_MAPPED"
     profiles_root = root / "00_PROFILE_SOURCES"
     profile_files: list[tuple[dict[str, str], dict[str, Path]]] = []
     for number, current in enumerate(HATEFUL_EIGHT, start=1):
@@ -297,7 +605,7 @@ def build_hateful_eight(template: Path, output: Path) -> None:
     incomplete = devin | {"hmis_id": ""}
     PROFILE = incomplete
     incomplete_path = partial / "99_PARTIAL_Quarterly_2026-03_Devin_Cross_MISSING_HMIS.pdf"
-    overlay_pdf(template / "BLANK Quarterly.pdf", incomplete_path, quarterly_placements("03/08/2026", "$2,380.00"))
+    overlay_pdf(template / "BLANK Quarterly.pdf", incomplete_path, quarterly_placements("03/08/2026", "$2,380.00"), field_map=QUARTERLY_FIELD_MAP)
 
     # Run 3: the missing records and completed revision arrive later. Originals remain in Run 2.
     follow_up = root / "03_CORRECTION_AND_MISSING_RECORD_FOLLOW_UP"
@@ -339,7 +647,7 @@ def main() -> None:
     output = args.output_dir
     if args.hateful_eight:
         build_hateful_eight(template, output)
-        print(output / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V2_SCHEDULE")
+        print(output / "HATEFUL_EIGHT_FICTIONAL_TRAINING_V3_MAPPED")
     else:
         build_profile(template, output, PROFILE)
         print(output)

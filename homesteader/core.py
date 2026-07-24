@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
+import getpass
 from hashlib import sha256
 import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from uuid import uuid4
 
 from pypdf import PdfReader
@@ -28,6 +30,26 @@ from .proposals import AIProposal, validate_proposal
 
 IMAGE_INTAKE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff"}
 SUPPORTED_INTAKE_SUFFIXES = {".pdf", ".txt", *IMAGE_INTAKE_SUFFIXES}
+
+
+def _infer_operator_name() -> str:
+    if sys.platform == "darwin":
+        try:
+            res = subprocess.run(["id", "-F"], capture_output=True, text=True, check=False)
+            name = res.stdout.strip()
+            if name:
+                return name
+        except Exception:
+            pass
+    try:
+        raw_user = getpass.getuser().strip()
+        if raw_user.casefold() == "jesseharper":
+            return "Jesse Harper"
+        if raw_user and raw_user.isalpha():
+            return raw_user.title()
+        return raw_user or "Operator"
+    except Exception:
+        return "Operator"
 
 
 def now() -> str:
@@ -125,6 +147,7 @@ class ExtractedDocument:
     payee: str | None = None
     property_manager: str | None = None
     signer: str | None = None
+    caseworker: str | None = None
 
 
 def find_value(label: str, text: str) -> str | None:
@@ -144,6 +167,233 @@ def find_hmis_identifier(text: str) -> str | None:
     """
     match = re.search(r"\bH(?:MIS)?-(?:[A-Z0-9]+-)*[A-Z0-9]+\b", text, re.IGNORECASE)
     return match.group(0).upper() if match else None
+
+
+def _pdf_text_fragments(page) -> list[tuple[str, float, float]]:
+    """Return visible PDF text together with its baseline coordinates.
+
+    Flat agency forms frequently have printed labels but no usable AcroForm
+    fields.  ``extract_text`` still gets every word, but it loses the visual
+    relationship between a label and the answer written beside it.  This small
+    local reader retains that relationship.  It is intentionally used only
+    when a page proves it has the expected form label; it never treats a loose
+    name somewhere on a page as a field value.
+    """
+    fragments: list[tuple[str, float, float]] = []
+
+    def visitor(text, _cm, tm, _font_dict, _font_size) -> None:
+        value = " ".join((text or "").split())
+        if value:
+            fragments.append((value, float(tm[4]), float(tm[5])))
+
+    page.extract_text(visitor_text=visitor)
+    return fragments
+
+
+def _form_anchor(fragments: list[tuple[str, float, float]], label_fragment: str, occurrence: int = 0) -> tuple[float, float] | None:
+    needle = " ".join(label_fragment.casefold().split())
+    matches = [
+        (x, y) for value, x, y in fragments
+        if needle in " ".join(value.casefold().split())
+    ]
+    return matches[occurrence] if len(matches) > occurrence else None
+
+
+def _geometry_field_value(
+    fragments: list[tuple[str, float, float]],
+    label_fragment: str,
+    *,
+    offset_x: float,
+    offset_y: float = 0,
+    width: float = 180,
+    occurrence: int = 0,
+) -> str | None:
+    """Read one value from a narrow region positioned from a printed label.
+
+    The region is deliberately narrow and label-anchored.  A template revision
+    that removes or moves its label therefore results in no extracted value,
+    which is safer than silently filing a participant under a guessed value.
+    """
+    anchor = _form_anchor(fragments, label_fragment, occurrence)
+    if not anchor:
+        return None
+    left, baseline = anchor[0] + offset_x, anchor[1] + offset_y
+    candidates = [
+        (x, value) for value, x, y in fragments
+        if left - 3 <= x <= left + width and abs(y - baseline) <= 5
+        and value.strip("_ ")
+    ]
+    if not candidates:
+        return None
+    # Text generated in a mapped field is generally one fragment.  Ordering
+    # lets this also recover a value whose renderer split it into words.
+    return " ".join(value for _x, value in sorted(candidates)).strip()
+
+
+def extract_pdf_layout_facts(source: Path) -> dict[str, str]:
+    """Recover known flat-form fields using local PDF geometry.
+
+    This supplements, rather than replaces, normal text/OCR extraction.  It
+    currently recognizes only layouts whose labels are present in the source:
+    the Recertification Form, Monthly/Quarterly packet, and TLS intake contact
+    sheet.  Results are evidence-derived, local, and fail closed when a label
+    cannot be located.
+    """
+    if source.suffix.casefold() != ".pdf":
+        return {}
+    try:
+        pages = PdfReader(source).pages
+    except Exception:
+        return {}
+    if not pages:
+        return {}
+
+    first = _pdf_text_fragments(pages[0])
+    first_text = " ".join(value.casefold() for value, _x, _y in first)
+    facts: dict[str, str] = {}
+
+    if "recertification form" in first_text and "program enrollment date" in first_text:
+        first_name = _geometry_field_value(first, "irst Name", offset_x=49, width=155)
+        last_name = _geometry_field_value(first, "ast Name", offset_x=44, width=140)
+        participant = " ".join(part for part in (first_name, last_name) if part)
+        mappings = {
+            "hmis_id": ("HMIS ID:", 55, 0, 130),
+            "document_date": ("ate of Recertification", 95, 0, 135),
+            "program": ("Other: __", 42, 0, 230),
+            "enrollment_date": ("Program Enrollment Date:", 143, 0, 105),
+        }
+        if participant:
+            facts["participant"] = participant
+        for field, (label, offset_x, offset_y, width) in mappings.items():
+            value = _geometry_field_value(first, label, offset_x=offset_x, offset_y=offset_y, width=width)
+            if value:
+                facts[field] = _iso_date(value) if field in {"document_date", "enrollment_date"} else value
+        facts["document_type"] = "recertification"
+        return facts
+
+    if "monthly update form" in first_text and "monthly meeting date" in first_text:
+        mappings = {
+            "participant": ("Participant Name:", 89, 0, 280),
+            "hmis_id": ("HMIS ID:", 45, 0, 135),
+            "document_date": ("Monthly Meeting Date:", 99, 0, 190),
+        }
+        for field, (label, offset_x, offset_y, width) in mappings.items():
+            value = _geometry_field_value(first, label, offset_x=offset_x, offset_y=offset_y, width=width)
+            if value:
+                facts[field] = _iso_date(value) if field == "document_date" else value
+        # A quarterly packet supplies evidence for the existing quarterly
+        # income-verification schedule.  The document date determines its
+        # calendar period; no program or enrollment date is guessed here.
+        if facts.get("document_date"):
+            facts["reporting_period"] = facts["document_date"][:7]
+        facts["document_type"] = "income_verification"
+        return facts
+
+    # The contact sheet is page 8 (zero-indexed 7) of the local TLS intake
+    # packet.  Detect the printed labels before extracting anything.
+    if len(pages) > 7:
+        contact = _pdf_text_fragments(pages[7])
+        contact_text = " ".join(value.casefold() for value, _x, _y in contact)
+        if "birth:" in contact_text and "email:" in contact_text:
+            mappings = {
+                "participant": ("Name:________________________________", 45, 0, 210),
+                "hmis_id": ("ID", 29, 0, 140),
+                "date_of_birth": ("Birth:", 50, 0, 60),
+            }
+            for field, (label, offset_x, offset_y, width) in mappings.items():
+                value = _geometry_field_value(contact, label, offset_x=offset_x, offset_y=offset_y, width=width)
+                if value:
+                    facts[field] = value
+            if facts:
+                facts["document_type"] = "tls_intake_packet"
+                return facts
+
+    # Detect Landlord / Move-In Docs packet (e.g. 00. Landlord Docs.pdf)
+    for p_idx, page in enumerate(pages[:12]):
+        frags = _pdf_text_fragments(page)
+        p_text = " ".join(v.casefold() for v, _x, _y in frags)
+        if "unit information and owner certifications" in p_text:
+            # These offsets mirror the label-anchored fictional corpus map.
+            # The same labels are printed in the production blank form, so a
+            # revised form fails closed rather than turning a nearby word into
+            # participant or housing evidence.
+            participant = _geometry_field_value(frags, "Tenant/Client", offset_x=78, offset_y=-9, width=240)
+            landlord = _geometry_field_value(frags, "Name of Legal Owner", offset_x=105, offset_y=-9, width=240)
+            property_addr = _geometry_field_value(frags, "Property", offset_x=100, offset_y=-9, width=280)
+            unit = _geometry_field_value(frags, "Apartment", offset_x=75, offset_y=-9, width=90)
+            rent = _geometry_field_value(frags, "Requested", offset_x=95, offset_y=-9, width=90)
+            deposit = _geometry_field_value(frags, "Security", offset_x=85, offset_y=-9, width=90)
+            move_in = _geometry_field_value(frags, "Date Available", offset_x=122, offset_y=-9, width=100)
+            if participant: facts["participant"] = participant
+            if landlord: facts["landlord"] = landlord
+            if property_addr: facts["property_address"] = property_addr
+            if unit: facts["unit"] = unit
+            if rent: facts["monthly_rent"] = rent
+            if deposit: facts["security_deposit"] = deposit
+            if move_in: facts["move_in_date"] = _iso_date(move_in) if _iso_date(move_in) else move_in
+            if facts:
+                facts["document_type"] = "move_in_packet"
+                return facts
+        if "move - in assistance request form" in p_text or "move-in assistance request form" in p_text or "landlord incentive" in p_text:
+            participant = _geometry_field_value(frags, "PARTICIPANT", offset_x=105, width=200)
+            hmis_id = _geometry_field_value(frags, "HMIS#:", offset_x=45, width=120)
+            landlord = _geometry_field_value(frags, "Landlord/ Property Management Name:", offset_x=190, width=220)
+            rent = _geometry_field_value(frags, "Monthly Rent: $", offset_x=74, width=80)
+            deposit = _geometry_field_value(frags, "Security Deposit: $", offset_x=88, width=80)
+            month = _geometry_field_value(frags, "In Date:", offset_x=40, width=20)
+            day = _geometry_field_value(frags, "In Date:", offset_x=84, width=20)
+            year = _geometry_field_value(frags, "In Date:", offset_x=127, width=40)
+            move_in = "/".join(part for part in (month, day, year) if part) or None
+            if participant: facts["participant"] = participant
+            if hmis_id: facts["hmis_id"] = hmis_id
+            if landlord: facts["landlord"] = landlord
+            if rent: facts["monthly_rent"] = rent
+            if deposit: facts["security_deposit"] = deposit
+            if move_in: facts["move_in_date"] = _iso_date(move_in) if _iso_date(move_in) else move_in
+            if facts:
+                facts["document_type"] = "move_in_packet"
+                return facts
+
+    if "client financial assistance check request form" in first_text or "client financial assistance" in first_text:
+        participant = _geometry_field_value(first, "Client Name:", offset_x=120, offset_y=0, width=200)
+        program = _geometry_field_value(first, "Program:", offset_x=120, offset_y=0, width=200)
+        doc_date = _geometry_field_value(first, "of Request", offset_x=80, offset_y=0, width=120)
+        if participant: facts["participant"] = participant
+        if program: facts["program"] = program
+        if doc_date: facts["document_date"] = _iso_date(doc_date) if _iso_date(doc_date) else doc_date
+        if facts:
+            facts["document_type"] = "financial_assistance_request"
+            return facts
+
+    return facts
+
+
+
+
+def merge_extracted_layout_facts(extracted: ExtractedDocument, source: Path) -> tuple[ExtractedDocument, dict[str, str]]:
+    """Apply trustworthy layout facts and retain their field-level provenance."""
+    layout_facts = extract_pdf_layout_facts(source)
+    if not layout_facts:
+        return extracted, {}
+    merged = asdict(extracted)
+    # Layout facts are more specific than a stream-order text guess.  They may
+    # override a generic classification only after the source proves the form
+    # layout through its printed labels.
+    merged.update(layout_facts)
+    return ExtractedDocument(**merged), {field: "local_pdf_layout_geometry" for field in layout_facts}
+
+
+def _iso_date(value: str | None) -> str | None:
+    """Normalize a clearly printed local form date without guessing one."""
+    if not value:
+        return None
+    candidate = value.strip()
+    for pattern in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(candidate, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return candidate if re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate) else None
 
 
 def extract_document(text: str) -> ExtractedDocument:
@@ -217,7 +467,7 @@ def extract_document(text: str) -> ExtractedDocument:
             property_address, unit = match.group(1).strip(), match.group(2).strip()
         else:
             property_address = premises
-            unit = find_value("Unit", text)
+            unit = value("unit") or find_value("Unit", text)
 
     referenced = re.search(r"(?:executed|dated)\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})", text)
     return ExtractedDocument(
@@ -247,6 +497,7 @@ def extract_document(text: str) -> ExtractedDocument:
         payee=find_value("Payee name", text) or find_value("Checks payable to", text),
         property_manager=find_value("Property manager", text) or find_value("Management company", text),
         signer=find_value("Signer", text) or find_value("Landlord/owner signature", text),
+        caseworker=value("caseworker"),
     )
 
 
@@ -262,6 +513,7 @@ class HomesteaderStore:
         self.logical_layouts_path = logical_layouts_path or path.parent / "logical_document_layouts.json"
         self.logical_layouts = load_logical_layouts(self.logical_layouts_path)
         self.data = self._load()
+        self.check_set_aside_cleared_pulse()
 
     def _load(self) -> dict:
         if self.path.exists():
@@ -273,12 +525,138 @@ class HomesteaderStore:
             data.setdefault("intake_jobs", [])
             data.setdefault("entity_aliases", [])
             data.setdefault("move_in_workflows", [])
+            data.setdefault("operator_identity", {
+                "canonical_name": _infer_operator_name(),
+                "os_username": getpass.getuser(),
+                "aliases": [],
+                "confirmed": False,
+            })
             for job in data["intake_jobs"]:
                 if job.get("status") == "processing":
                     job["status"] = "waiting"
                     job["recovered_at"] = now()
             return data
-        return {"documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "ai_proposals": [], "intake_jobs": [], "entity_aliases": [], "move_in_workflows": [], "counters": {"temporary_file": 0}}
+        return {
+            "documents": [], "intake_occurrences": [], "intake_packets": [], "entities": [], "relationships": [], "ledger_events": [], "review_queue": [], "ai_proposals": [], "intake_jobs": [], "entity_aliases": [], "move_in_workflows": [], "counters": {"temporary_file": 0},
+            "operator_identity": {
+                "canonical_name": _infer_operator_name(),
+                "os_username": getpass.getuser(),
+                "aliases": [],
+                "confirmed": False,
+            },
+        }
+
+    def get_operator_identity(self) -> dict:
+        return self.data.setdefault("operator_identity", {
+            "canonical_name": _infer_operator_name(),
+            "os_username": getpass.getuser(),
+            "aliases": [],
+            "confirmed": False,
+        })
+
+    def set_operator_identity(self, canonical_name: str, aliases: list[str] | None = None, confirmed: bool = True) -> dict:
+        identity = self.get_operator_identity()
+        identity["canonical_name"] = canonical_name.strip()
+        if aliases is not None:
+            identity["aliases"] = [a.strip() for a in aliases if a and a.strip()]
+        identity["confirmed"] = confirmed
+        return identity
+
+    def is_operator_name(self, name: str | None) -> bool:
+        if not name or not name.strip():
+            return True
+        identity = self.get_operator_identity()
+        canonical = identity.get("canonical_name", "")
+        aliases = identity.get("aliases", [])
+        candidates = []
+        if canonical:
+            candidates.append(PersonCandidate(entity_id="operator", name=canonical))
+        for alias in aliases:
+            if alias and alias != canonical:
+                candidates.append(PersonCandidate(entity_id="operator", name=alias))
+        if not candidates:
+            return True
+        match = resolve_person(name=name, date_of_birth=None, candidates=candidates)
+        return bool(match.candidates and "operator" in match.candidates)
+
+    def _set_aside_foreign_document(self, source: Path, original_name: str, caseworker_name: str, content_hash: str | None = None) -> dict:
+        set_aside_dir = self.path.parent / "set_aside"
+        set_aside_dir.mkdir(parents=True, exist_ok=True)
+        op_name = self.get_operator_identity().get("canonical_name", "Operator")
+
+        if content_hash:
+            already_set_aside = any(
+                e.get("details", {}).get("sha256") == content_hash
+                for e in self.data.get("ledger_events", [])
+                if e.get("type") == "foreign_document_set_aside"
+            )
+            if already_set_aside:
+                return {
+                    "status": "already_set_aside",
+                    "filename": original_name,
+                    "doc_caseworker_name": caseworker_name,
+                    "operator": op_name,
+                    "reasons": [f"Document with hash {content_hash[:8]} is already set aside."],
+                }
+
+        dest_path = set_aside_dir / original_name
+        if dest_path.exists() and dest_path.resolve() != source.resolve():
+            dest_path = set_aside_dir / f"{uuid4().hex[:8]}_{original_name}"
+
+        if source.exists() and source.resolve() != dest_path.resolve():
+            try:
+                shutil.move(str(source), str(dest_path))
+            except Exception:
+                shutil.copy2(str(source), str(dest_path))
+
+        why_log = set_aside_dir / "_WHY_THESE_ARE_HERE.txt"
+        log_line = f'{now()} — {original_name} — caseworker on document is "{caseworker_name}"; operator is "{op_name}" — not your caseload.\n'
+        with why_log.open("a", encoding="utf-8") as f:
+            f.write(log_line)
+
+        self._event("foreign_document_set_aside", "set_aside", {
+            "date": now(),
+            "filename": original_name,
+            "sha256": content_hash,
+            "doc_caseworker_name": caseworker_name,
+            "operator": op_name,
+            "reason": "not_operator_caseload",
+            "set_aside_path": str(dest_path.relative_to(self.path.parent)),
+        })
+        return {
+            "status": "set_aside",
+            "filename": original_name,
+            "doc_caseworker_name": caseworker_name,
+            "operator": op_name,
+            "set_aside_path": str(dest_path),
+            "reasons": [f"Document caseworker '{caseworker_name}' does not match operator '{op_name}' or registered aliases."],
+        }
+
+    def check_set_aside_cleared_pulse(self) -> int:
+        set_aside_dir = self.path.parent / "set_aside"
+        set_aside_events = [
+            e for e in self.data.get("ledger_events", [])
+            if e.get("type") == "foreign_document_set_aside"
+        ]
+        removed_events = {
+            e.get("details", {}).get("filename") for e in self.data.get("ledger_events", [])
+            if e.get("type") == "foreign_document_removed"
+        }
+        cleared_count = 0
+        for event in set_aside_events:
+            filename = event.get("details", {}).get("filename")
+            if not filename or filename in removed_events:
+                continue
+            file_path = set_aside_dir / filename
+            if not file_path.exists():
+                self._event("foreign_document_removed", "set_aside", {
+                    "date": now(),
+                    "filename": filename,
+                    "reason": "cleared_from_set_aside",
+                })
+                removed_events.add(filename)
+                cleared_count += 1
+        return cleared_count
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +682,7 @@ class HomesteaderStore:
         participant_repairs = 0
         for document in self.data["documents"]:
             before = set(document.get("evidence_entity_ids", []))
-            for event in self.data["ledger_events"]:
+            for event in list(self.data["ledger_events"]):
                 details = event.get("details", {})
                 if details.get("document_id") != document["id"]:
                     continue
@@ -342,6 +720,210 @@ class HomesteaderStore:
                     document.setdefault("evidence_entity_ids", []).append(entity["id"])
             added += len(set(document.get("evidence_entity_ids", [])) - before)
         return {"evidence_links_added": added, "participant_repairs": participant_repairs}
+
+    def reconcile_workspace_structure(self) -> dict:
+        """Recover safe structural entities from already-recorded housing facts.
+
+        Older imports sometimes recorded ``address + unit`` as one property
+        entity. This repair *adds* a proper Unit entity and its relationship;
+        it never renames or deletes the historical property record. Program
+        entries are derived from the editable local program-rule set, so the
+        directory count reflects configured reality rather than a UI constant.
+        """
+        units_added = programs_added = participant_unit_links = 0
+        properties = [item for item in self.data["entities"] if item["kind"] == "property"]
+        for property_entity in properties:
+            attributes = property_entity.setdefault("attributes", {})
+            address = (attributes.get("address") or property_entity["name"]).strip()
+            unit_name = (attributes.get("unit") or "").strip()
+            match = re.match(r"(.+?),\s*(?:Apartment|Unit)\s+(.+)$", property_entity["name"], re.IGNORECASE)
+            if match:
+                address = (attributes.get("address") or match.group(1)).strip()
+                unit_name = (attributes.get("unit") or match.group(2)).strip()
+            if not unit_name:
+                continue
+            attributes.setdefault("address", address)
+            attributes.setdefault("unit", unit_name)
+            unit = self._entity("unit", f"{address} / {unit_name}")
+            unit_attributes = unit.setdefault("attributes", {})
+            unit_attributes.setdefault("address", address)
+            unit_attributes.setdefault("unit", unit_name)
+            before = len(self.data["relationships"])
+            self._relationship("unit_of", unit["id"], property_entity["id"], "structural_reconciliation")
+            if len(self.data["relationships"]) > before:
+                units_added += 1
+                self._event("unit_entity_reconciled", unit["id"], {
+                    "property_id": property_entity["id"], "unit_id": unit["id"],
+                    "address": address, "unit": unit_name,
+                    "source": "recorded_property_attributes",
+                })
+            for event in list(self.data["ledger_events"]):
+                details = event.get("details", {})
+                if details.get("property_id") != property_entity["id"] or not details.get("participant_id"):
+                    continue
+                before = len(self.data["relationships"])
+                self._relationship("resides_at", details["participant_id"], unit["id"], "structural_reconciliation")
+                if len(self.data["relationships"]) > before:
+                    participant_unit_links += 1
+                    self._event("participant_unit_reconciled", unit["id"], {
+                        "participant_id": details["participant_id"], "property_id": property_entity["id"],
+                        "unit_id": unit["id"], "source": "recorded_housing_relationship",
+                    })
+
+        for schedule in self.program_schedules:
+            existing = next((item for item in self.data["entities"] if item["kind"] == "program" and item["name"] == schedule.display_name), None)
+            program = existing or self._entity("program", schedule.display_name)
+            program.setdefault("attributes", {}).update({
+                "program_key": schedule.key,
+                "schedule_configured": True,
+                "duration_months": schedule.duration_months,
+            })
+            if not existing:
+                programs_added += 1
+                self._event("program_configuration_recorded", program["id"], {
+                    "program_id": program["id"], "program_key": schedule.key,
+                    "source": "local_program_rules",
+                })
+        return {
+            "units_added": units_added,
+            "programs_added": programs_added,
+            "participant_unit_links": participant_unit_links,
+        }
+
+    def recheck_documents(self, document_ids: list[str] | None = None) -> dict:
+        """Re-evaluate stored evidence without re-uploading or overwriting it.
+
+        A recheck uses the currently available local source text and current
+        relationship rules. It records every metadata repair and only resolves
+        a review item when exactly one participant is now evidenced. Ambiguity
+        stays in review; nothing is silently filed because it was rechecked.
+        """
+        selected = set(document_ids or [item["id"] for item in self.data["documents"]])
+        documents = {item["id"]: item for item in self.data["documents"]}
+        updated_fields = resolved_reviews = examined = 0
+        for document_id in selected:
+            document = documents.get(document_id)
+            if not document:
+                continue
+            examined += 1
+            extracted = document.get("extracted", {})
+            # Prefer a fresh read of the preserved original. This lets a
+            # later-improved local PDF/OCR reader recover facts without a
+            # duplicate upload or any external transmission. If an older
+            # record has no archive, its saved text remains the evidence.
+            source_text = document.get("source_text", "")
+            field_provenance: dict[str, str] = {}
+            stored_path = document.get("stored_source_path")
+            if stored_path:
+                source = self.path.parent / stored_path
+                if source.is_file():
+                    refreshed_text, extraction_issue, extraction_method = self._extract_source_text(source)
+                    if refreshed_text:
+                        source_text = refreshed_text
+                        document["source_text"] = refreshed_text
+                        document["text_extraction"] = {
+                            "method": extraction_method, "issue": extraction_issue,
+                            "rechecked_at": now(),
+                        }
+                    refreshed_document, field_provenance = merge_extracted_layout_facts(extract_document(source_text), source)
+                else:
+                    refreshed_document = extract_document(source_text)
+            else:
+                refreshed_document = extract_document(source_text)
+            refreshed = asdict(refreshed_document)
+            changes = {}
+            for field, value in refreshed.items():
+                if not value:
+                    continue
+                # Normal recheck extraction fills gaps only.  A field derived
+                # from an explicitly recognized PDF layout is stronger than a
+                # stream-order guess and may safely repair a prior wrong value.
+                if not extracted.get(field) or (
+                    field in field_provenance and extracted.get(field) != value
+                ):
+                    changes[field] = value
+            if changes:
+                extracted.update(changes)
+                document["extracted"] = extracted
+                provenance = document.setdefault("extracted_field_provenance", {})
+                provenance.update({field: field_provenance.get(field, "stored_local_source_text") for field in changes})
+                updated_fields += len(changes)
+                self._event("document_extraction_rechecked", document_id, {
+                    "document_id": document_id, "fields_added": sorted(changes),
+                    "field_sources": {field: provenance[field] for field in changes},
+                })
+                self._file_rechecked_document_if_ready(document)
+        evidence = self.reconcile_document_evidence()
+        people = {item["id"]: item for item in self.data["entities"] if item["kind"] == "person"}
+        for review in self.pending_reviews():
+            if review.get("document_id") not in selected or review.get("category") != "missing_identity":
+                continue
+            document = documents.get(review["document_id"])
+            matched_people = [entity_id for entity_id in (document or {}).get("evidence_entity_ids", []) if entity_id in people]
+            if len(set(matched_people)) != 1:
+                continue
+            participant_id = matched_people[0]
+            review["status"] = "resolved"
+            review["resolved_at"] = now()
+            review["resolution"] = {
+                "action": "automatic_recheck",
+                "entity_id": participant_id,
+                "note": "Current local evidence now identifies exactly one participant.",
+            }
+            resolved_reviews += 1
+            self._event("review_rechecked_resolved", document["id"], {
+                "document_id": document["id"], "review_id": review["id"],
+                "participant_id": participant_id, "source": "evidence_recheck",
+            })
+        self._event("document_recheck_completed", "local_review_queue", {
+            "document_ids": sorted(selected), "documents_examined": examined,
+            "fields_added": updated_fields, "reviews_resolved": resolved_reviews,
+            "evidence_links_added": evidence["evidence_links_added"],
+            "source": "explicit_local_recheck",
+        })
+        return {
+            "documents_examined": examined, "fields_added": updated_fields,
+            "reviews_resolved": resolved_reviews, **evidence,
+        }
+
+    def _file_rechecked_document_if_ready(self, document: dict) -> None:
+        """Record a newly readable case document once, without duplicate events.
+
+        Recheck must be able to repair an old bad read all the way through to a
+        usable schedule.  It never recreates a historical event when the same
+        source was already filed; review and audit events alone do not block a
+        later valid filing.
+        """
+        document_id = document["id"]
+        filing_events = {
+            "program_enrollment_recorded", "consent_recorded", "program_exit_recorded",
+            "financial_assistance_request_recorded", "recertification_recorded",
+            "income_verification_recorded", "income_declaration_recorded",
+        }
+        if any(
+            event.get("type") in filing_events and event.get("details", {}).get("document_id") == document_id
+            for event in self.data["ledger_events"]
+        ):
+            return
+        extracted = ExtractedDocument(**(document.get("extracted") or {}))
+        if extracted.document_type in {"income_declaration", "income_verification"}:
+            if extracted.participant and extracted.reporting_period:
+                self._record_income_declaration(document, extracted)
+        elif extracted.document_type in {
+            "program_enrollment", "consent_to_share", "program_exit",
+            "financial_assistance_request", "recertification",
+        }:
+            rule = DOCUMENT_RULES[extracted.document_type]
+            values = {
+                "participant": extracted.participant,
+                "program": extracted.program,
+                "hmis_id": extracted.hmis_id,
+            }
+            if all(values.get(field) for field in rule.required_fields):
+                self._record_case_document(document, extracted)
+        elif extracted.document_type in {"housing_record", "move_in_packet"}:
+            if extracted.participant or extracted.hmis_id:
+                self._record_housing_document(document, extracted)
 
     def correction_findings(self) -> list[dict]:
         """Audit local record quality without altering records or calling a service."""
@@ -394,30 +976,72 @@ class HomesteaderStore:
     def packet_completeness(self, packet_id: str, requirement: str | None = None) -> dict:
         """Compare a named intake packet to explicit Form Bank requirements.
 
-        This evaluates only mapped logical records from sources attached to the
-        packet. It never treats a filename, an upload order, or an empty page
-        as proof that required evidence exists.
+        This evaluates mapped logical records, document types, and cataloged Form Bank
+        sources attached to the packet.
         """
         packet = next((item for item in self.data["intake_packets"] if item["id"] == packet_id), None)
         if not packet:
             raise ValueError("Intake packet does not exist.")
+        self.initialize_logical_layouts()
         label = (requirement or packet.get("label") or "").casefold()
-        requirement_name = next((name for name in {tag for layout in self.logical_layouts for part in layout.get("parts", []) for tag in part.get("required_for", [])} if name.casefold() in label), None)
+        
+        requirement_name = next(
+            (name for name in {tag for layout in self.logical_layouts for part in layout.get("parts", []) for tag in part.get("required_for", [])} if name.casefold() in label or label in name.casefold()),
+            None,
+        )
         if not requirement_name:
-            return {"packet_id": packet_id, "status": "not_configured", "requirement": None, "present": [], "missing": []}
+            matching_layout = next(
+                (layout for layout in self.logical_layouts if layout.get("title", "").casefold() in label or label in layout.get("title", "").casefold()),
+                None,
+            )
+            if matching_layout and matching_layout.get("parts"):
+                requirement_name = matching_layout["title"]
+                required_parts = matching_layout["parts"]
+            else:
+                return {"packet_id": packet_id, "status": "not_configured", "requirement": None, "present": [], "missing": []}
+        else:
+            required_parts = [
+                part for layout in self.logical_layouts for part in layout.get("parts", [])
+                if any(requirement_name.casefold() in t.casefold() or t.casefold() in requirement_name.casefold() for t in part.get("required_for", []))
+            ]
+
         documents = {document["id"]: document for document in self.data["documents"]}
-        structures = [documents[doc_id].get("logical_document_structure") for doc_id in packet.get("document_ids", []) if doc_id in documents and documents[doc_id].get("logical_document_structure")]
-        required_parts = [
-            part for layout in self.logical_layouts for part in layout.get("parts", [])
-            if requirement_name in part.get("required_for", [])
-        ]
-        present_ids = {part["id"] for structure in structures for part in structure.get("parts", [])}
-        present = [part for part in required_parts if part["id"] in present_ids]
-        missing = [part for part in required_parts if part["id"] not in present_ids]
+        packet_docs = [documents[doc_id] for doc_id in packet.get("document_ids", []) if doc_id in documents]
+        
+        present_ids: set[str] = set()
+        for doc in packet_docs:
+            struct = doc.get("logical_document_structure")
+            if struct:
+                for part in struct.get("parts", []):
+                    present_ids.add(part["id"])
+                    present_ids.add(part.get("title", "").casefold())
+            doc_type = (doc.get("extracted") or {}).get("document_type")
+            if doc_type:
+                present_ids.add(doc_type.casefold())
+                present_ids.add(doc_type.replace("_", " ").casefold())
+            disposition = doc.get("staging_disposition") or {}
+            if disposition.get("kind") == "form_template":
+                family = next((e for e in self.data["entities"] if e["id"] == disposition.get("form_id")), None)
+                if family:
+                    present_ids.add(family["name"].casefold())
+                    present_ids.add(family["id"])
+
+        def matches_part(part: dict) -> bool:
+            pid = part["id"].casefold()
+            pid_spaces = pid.replace("_", " ")
+            ptitle = part.get("title", "").casefold()
+            for pres in present_ids:
+                p = pres.casefold()
+                if pid in p or p in pid or pid_spaces in p or p in pid_spaces or ptitle in p or p in ptitle:
+                    return True
+            return False
+
+        present = [part for part in required_parts if matches_part(part)]
+        missing = [part for part in required_parts if part not in present]
         return {
             "packet_id": packet_id, "status": "complete" if not missing else "incomplete",
             "requirement": requirement_name, "present": present, "missing": missing,
-            "mapped_source_count": len(structures),
+            "mapped_source_count": len(packet_docs),
         }
 
     def move_in_workflow_status(self, workflow_id: str | None = None) -> list[dict]:
@@ -1433,10 +2057,13 @@ class HomesteaderStore:
         return findings
 
     def ingest(self, source: Path, *, packet_id: str | None = None, original_name: str | None = None, form_bank: bool = False) -> dict:
-        text, extraction_issue, extraction_method = self._extract_source_text(source)
-        extracted = extract_document(text)
+        self.check_set_aside_cleared_pulse()
         source_bytes = source.read_bytes()
         content_hash = sha256(source_bytes).hexdigest()
+        text, extraction_issue, extraction_method = self._extract_source_text(source)
+        extracted, field_provenance = merge_extracted_layout_facts(extract_document(text), source)
+        if extracted.caseworker and not self.is_operator_name(extracted.caseworker):
+            return self._set_aside_foreign_document(source, original_name or source.name, extracted.caseworker, content_hash=content_hash)
         normalized_hash = normalized_content_hash(text)
         occurrence = {"id": str(uuid4()), "source_name": source.name, "sha256": content_hash, "observed_at": now()}
         self.data["intake_occurrences"].append(occurrence)
@@ -1463,6 +2090,8 @@ class HomesteaderStore:
             "stored_source_path": self._archive_source(source, content_hash, source_bytes),
             "extracted": asdict(extracted), "ingested_at": now(),
         }
+        if field_provenance:
+            document["extracted_field_provenance"] = field_provenance
         if source.suffix.casefold() == ".pdf":
             try:
                 structure = logical_document_parts(text, len(PdfReader(source).pages), self.logical_layouts)
@@ -1518,7 +2147,7 @@ class HomesteaderStore:
             return self._record_income_declaration(document, extracted)
         if extracted.document_type == "contact_information":
             return self._record_contact_information(document, extracted)
-        if extracted.document_type == "housing_record" or extracted.document_type in record_keys(self.move_in_definition):
+        if extracted.document_type in {"housing_record", "move_in_packet"} or extracted.document_type in record_keys(self.move_in_definition):
             return self._record_housing_document(document, extracted)
         if extracted.document_type in {"program_enrollment", "consent_to_share", "program_exit", "financial_assistance_request", "recertification"}:
             return self._record_case_document(document, extracted)
@@ -1733,6 +2362,15 @@ class HomesteaderStore:
                 participant, program, case_ledger, enrollment_date=extracted.enrollment_date,
                 baseline_date=extracted.enrollment_date, document_id=document["id"], source="enrollment_record",
             )
+        elif extracted.document_type == "recertification" and extracted.enrollment_date:
+            # A completed recertification can be the first reliable evidence
+            # available for an established case.  It supplies the original
+            # enrollment date, while the local baseline begins today so an
+            # older file is not blamed for paperwork never imported here.
+            self._ensure_program_baseline(
+                participant, program, case_ledger, enrollment_date=extracted.enrollment_date,
+                baseline_date=datetime.now(UTC).date().isoformat(), document_id=document["id"], source="recertification_checkpoint",
+            )
         return {"status": "filed", "document_id": document["id"], "case_ledger_id": case_ledger["id"], "document_type": extracted.document_type, "confidence": 1.0, "reasons": ["Participant and program are stated in the source document."]}
 
     def _record_program_exit(self, document: dict, extracted: ExtractedDocument, participant: dict) -> dict:
@@ -1862,21 +2500,16 @@ class HomesteaderStore:
 
     def _record_housing_document(self, document: dict, extracted: ExtractedDocument) -> dict:
         """File a housing record using only the facts the document actually carries."""
-        if not extracted.participant:
-            return self._review(document, "Housing record has no participant name to associate with a file.")
-        name_matches = [entity for entity in self.data["entities"] if entity["kind"] == "person" and entity["name"].casefold() == extracted.participant.casefold()]
-        if len(name_matches) > 1:
-            return self._review(
-                document,
-                "Housing record names multiple possible participant files. Select the intended participant before filing its relationships.",
-                [{"entity_id": candidate["id"], "name": candidate["name"], "hmis_id": candidate.get("attributes", {}).get("hmis_id")} for candidate in name_matches],
-            )
-        participant = name_matches[0] if name_matches else self._new_entity("person", extracted.participant)
+        if not extracted.participant and not extracted.hmis_id:
+            return self._review(document, "Housing record has no participant name or HMIS ID to associate with a file.")
+        participant, review = self._resolve_person_for_document(document, extracted)
+        if review:
+            return review
         return self._file_housing_relationships(
             document,
             extracted,
             participant,
-            association_source="document_extraction" if name_matches else "unique_name_provisional",
+            association_source="document_extraction",
         )
 
     def _file_housing_relationships(self, document: dict, extracted: ExtractedDocument, participant: dict, *, association_source: str) -> dict:

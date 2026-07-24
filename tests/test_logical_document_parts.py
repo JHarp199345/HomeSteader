@@ -79,5 +79,24 @@ class LogicalDocumentPartTests(unittest.TestCase):
             self.assertEqual([part["id"] for part in status["missing"]], ["hmis_consent"])
 
 
+    def test_form_bank_template_completeness_matching(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = HomesteaderStore(root / "state.json")
+            form_file = root / "blank_move_in.txt"
+            form_file.write_text("Landlord Move-In & Lease Agreement Form")
+            w9_file = root / "blank_w9.txt"
+            w9_file.write_text("Landlord W-9 Form")
+            
+            res1 = store.ingest_form_template(form_file, original_name="Landlord Move-In Packet.txt")
+            res2 = store.ingest_form_template(w9_file, original_name="Landlord W-9 Form.txt")
+            
+            packet = store.start_intake_packet("Landlord Move-In Packet — Casey Reed")
+            packet["document_ids"].extend([res1["document_id"], res2["document_id"]])
+            
+            status = store.packet_completeness(packet["id"])
+            self.assertEqual(status["status"], "complete")
+
+
 if __name__ == "__main__":
     unittest.main()
